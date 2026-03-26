@@ -520,7 +520,7 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="generation-row" style="margin-top: 10px;">
         <div class="generation-item">
           <img src="{{ e.original_image_path }}" alt="original" style="border: 3px solid #3498db;">
-          <div><strong>Original</strong></div>
+          <div><strong>Original</strong>{% if e.source_class %} <span style="color: #3498db; font-size: 0.85em;">({{ e.source_class }})</span>{% endif %}</div>
           <div style="color: #27ae60;">{{ "%.0f"|format(e.original_confidence * 100) }}%</div>
         </div>
         {% for g in e.generations[:3] %}
@@ -599,7 +599,7 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="generation-row" style="margin-top: 10px;">
         <div class="generation-item">
           <img src="{{ e.original_image_path }}" alt="original" style="border: 3px solid #3498db;">
-          <div><strong>Original</strong></div>
+          <div><strong>Original</strong>{% if e.source_class %} <span style="color: #3498db; font-size: 0.85em;">({{ e.source_class }})</span>{% endif %}</div>
           <div>{{ "%.0f"|format(e.original_confidence * 100) }}%</div>
         </div>
         {% for g in e.generations[:3] %}
@@ -674,7 +674,7 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="generation-row" style="margin-top: 10px;">
         <div class="generation-item">
           <img src="{{ e.original_image_path }}" alt="original" style="border: 3px solid #3498db;">
-          <div><strong>Original</strong></div>
+          <div><strong>Original</strong>{% if e.source_class %} <span style="color: #3498db; font-size: 0.85em;">({{ e.source_class }})</span>{% endif %}</div>
           <div style="color: #27ae60;">{{ "%.0f"|format(e.original_confidence * 100) }}%</div>
         </div>
         {% for g in e.generations[:3] %}
@@ -748,7 +748,7 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="generation-row" style="margin-top: 10px;">
         <div class="generation-item">
           <img src="{{ e.original_image_path }}" alt="original" style="border: 3px solid #3498db;">
-          <div><strong>Original</strong></div>
+          <div><strong>Original</strong>{% if e.source_class %} <span style="color: #3498db; font-size: 0.85em;">({{ e.source_class }})</span>{% endif %}</div>
           <div>{{ "%.0f"|format(e.original_confidence * 100) }}%</div>
         </div>
         {% for g in e.generations[:3] %}
@@ -809,7 +809,7 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="generation-row" style="margin-top: 10px;">
         <div class="generation-item">
           <img src="{{ e.original_image_path }}" alt="original" style="border: 3px solid #3498db;">
-          <div><strong>Original</strong></div>
+          <div><strong>Original</strong>{% if e.source_class %} <span style="color: #3498db; font-size: 0.85em;">({{ e.source_class }})</span>{% endif %}</div>
           <div>{{ "%.0f"|format(e.original_confidence * 100) }}%</div>
         </div>
         {% for g in e.generations[:3] %}
@@ -1024,7 +1024,7 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="generation-row">
         <div class="generation-item">
           <img data-src="{{ e.original_image_path }}" alt="original">
-          <div><strong>Original</strong></div>
+          <div><strong>Original</strong>{% if e.source_class %} <span style="color: #3498db; font-size: 0.85em;">({{ e.source_class }})</span>{% endif %}</div>
           <div>{{ "%.3f"|format(e.original_confidence) }}</div>
         </div>
         {% for g in e.generations %}
@@ -1088,7 +1088,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <div class="generation-row">
       <div class="generation-item">
         <img data-src="{{ e.original_image_path }}" alt="original">
-        <div><strong>Original</strong></div>
+        <div><strong>Original</strong>{% if e.source_class %} <span style="color: #3498db; font-size: 0.85em;">({{ e.source_class }})</span>{% endif %}</div>
       </div>
       {% for g in e.generations %}
       <div class="generation-item">
@@ -1302,13 +1302,14 @@ _MD_TEMPLATE = """# Classification Model Bias Analysis Report
 #### {{ loop.index }}. {{ e.instruction }}
 
 - **Hypothesis**: {{ e.hypothesis }}
-- **Mean Δ**: {{ "%+.3f"|format(e.mean_delta) }} (range: {{ "%+.3f"|format(e.min_delta) }} to {{ "%+.3f"|format(e.max_delta) }})
+{% if e.source_class %}- **Source class**: {{ e.source_class }}
+{% endif %}- **Mean Δ**: {{ "%+.3f"|format(e.mean_delta) }} (range: {{ "%+.3f"|format(e.min_delta) }} to {{ "%+.3f"|format(e.max_delta) }})
 - **Confirmations**: {{ e.confirmation_count }}/{{ e.generations|length }} generations
 - **Original confidence**: {{ "%.3f"|format(e.original_confidence) }}
 
 | Generation | Δ Confidence | Image |
 |---|---|---|
-| Original | - | ![Original]({{ e.original_image_path }}) |
+| Original{% if e.source_class %} ({{ e.source_class }}){% endif %} | - | ![Original]({{ e.original_image_path }}) |
 {% for g in e.generations -%}
 | Gen {{ loop.index }} | {{ "%+.3f"|format(g.delta) }} | ![Gen {{ loop.index }}]({{ g.edited_image_path }}) |
 {% endfor %}
@@ -1317,10 +1318,10 @@ _MD_TEMPLATE = """# Classification Model Bias Analysis Report
 
 ### All Edit Results
 
-| Edit | Type | Priority | Mean Δ | Range | Confirmed |
-|---|---|---|---|---|---|
+| Edit | Type | Source Class | Priority | Mean Δ | Range | Confirmed |
+|---|---|---|---|---|---|---|
 {% for e in r.edit_results -%}
-| {{ e.instruction[:50] }}{% if e.instruction|length > 50 %}...{% endif %} | {{ e.edit_type }} | {{ e.priority }} | {{ "%+.3f"|format(e.mean_delta) }} | {{ "%+.3f"|format(e.min_delta) }} to {{ "%+.3f"|format(e.max_delta) }} | {{ "✓ " + (e.confirmation_count|string) + "/" + (e.generations|length|string) if e.confirmed else "✗" }} |
+| {{ e.instruction[:50] }}{% if e.instruction|length > 50 %}...{% endif %} | {{ e.edit_type }} | {{ e.source_class if e.source_class else '-' }} | {{ e.priority }} | {{ "%+.3f"|format(e.mean_delta) }} | {{ "%+.3f"|format(e.min_delta) }} to {{ "%+.3f"|format(e.max_delta) }} | {{ "✓ " + (e.confirmation_count|string) + "/" + (e.generations|length|string) if e.confirmed else "✗" }} |
 {% endfor %}
 {% endfor %}
 

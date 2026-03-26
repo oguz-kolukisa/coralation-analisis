@@ -641,6 +641,7 @@ class EditInstruction:
     target: str  # "positive" or "negative"
     priority: int = 3  # 1-5, higher = more likely to reveal bias
     image_index: int = 0
+    source_class: str = ""  # original class of the image (for negatives)
 
 
 @dataclass

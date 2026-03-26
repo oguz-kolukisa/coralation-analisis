@@ -108,6 +108,7 @@ class EditResult:
 
     feature_type: str = ""
     feature_name: str = ""
+    source_class: str = ""
     likely_failed: bool = False
 
     @property
@@ -1063,6 +1064,7 @@ class AnalysisPipeline:
         )
         for instr in analysis.edit_instructions:
             instr.image_index = sample.index
+            instr.source_class = sample.true_label
         return [EditInput(sample.image, instr, sample.confidence) for instr in analysis.edit_instructions]
 
     def _to_detected_features(self, feature_dicts: list[dict]) -> list[DetectedFeature]:
@@ -1273,7 +1275,7 @@ class AnalysisPipeline:
 
         return EditResult(
             instruction=instr.edit, hypothesis=instr.hypothesis,
-            edit_type=instr.type, target_type=instr.target,
+            edit_type=instr.type, target_type=instr.target, source_class=instr.source_class,
             priority=instr.priority, original_confidence=orig_conf,
             original_image_path=orig_path, generations=generations,
             mean_edited_confidence=mean_conf,
