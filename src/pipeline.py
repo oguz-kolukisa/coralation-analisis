@@ -363,19 +363,38 @@ class AnalysisPipeline:
                 "VLM: final analysis",
             ]
 
+            n_classes = len(states)
             self._pbar = tqdm(
                 total=len(phase_fns), desc="Pipeline", unit="phase", ncols=120,
-                bar_format="{desc} {n_fmt}/{total_fmt} |{bar:20}| {postfix}",
+                bar_format="{desc} |{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
             )
+            self._pbar.set_postfix_str(f"{n_classes} classes")
             for phase_fn, name in zip(phase_fns, phase_names):
-                self._pbar.set_description(name)
+                self._pbar.set_description(f"Phase: {name}")
                 phase_fn(states)
                 self._pbar.update(1)
             self._pbar.close()
             self._pbar = None
-            print()
+            self._print_summary(states)
 
         return cached_results + self._collect_batch_results(states)
+
+    def _print_summary(self, states: list[BatchClassState]):
+        """Print a summary of what was processed."""
+        active = [s for s in states if not s.failed]
+        failed = [s for s in states if s.failed]
+        total_baseline = sum(len(s.result.baseline_results) for s in active)
+        total_edits = sum(len(s.edit_inputs) for s in active)
+        total_generated = sum(len(s.pending) for s in active)
+        total_confirmed = sum(len(s.result.confirmed_hypotheses) for s in active)
+        print(f"\n{'='*60}")
+        print(f"  Pipeline complete: {len(active)} classes"
+              f"{f' ({len(failed)} failed)' if failed else ''}")
+        print(f"  Baseline classifications:  {total_baseline:,}")
+        print(f"  Edit hypotheses:           {total_edits:,}")
+        print(f"  Generated images:          {total_generated:,}")
+        print(f"  Confirmed biases:          {total_confirmed:,}")
+        print(f"{'='*60}\n")
 
     def _init_batch_states(
         self, classes: list[str],
@@ -403,7 +422,9 @@ class AnalysisPipeline:
         """Phase 1: VLM discovers knowledge-based features for all classes."""
         self.models.vlm()
         active = self._active_states(states)
-        for state in tqdm(active, desc="  Knowledge", leave=False, unit="cls"):
+        for i, state in enumerate(active):
+            label = f"  Knowledge [{i+1}/{len(active)}] {state.class_name}"
+            self._pbar.set_postfix_str(label.strip()) if self._pbar else None
             try:
                 all_classes = self.models.sampler().get_label_names()
                 features = self.models._vlm.generate_knowledge_based_features(
@@ -417,28 +438,77 @@ class AnalysisPipeline:
         self.models.offload_vlm()
 
     def _phase2_classifier_baseline(self, states: list[BatchClassState]):
-        """Phase 2: Classifier samples images + runs baseline + Grad-CAM."""
+        """Phase 2: Classifier baseline + negative class selection from predictions."""
         self.models.classifier()
         active = self._active_states(states)
-        for state in tqdm(active, desc="  Baseline", leave=False, unit="cls"):
+        self._phase2a_positive_baseline(active)
+        self._phase2b_negative_sampling(active)
+        self.models.offload_classifier()
+
+    def _phase2a_positive_baseline(self, active: list[BatchClassState]):
+        """Phase 2a: Sample positives + baseline classification with Grad-CAM."""
+        for i, state in enumerate(active):
+            label = f"  Baseline [{i+1}/{len(active)}] {state.class_name}"
+            self._pbar.set_postfix_str(label.strip()) if self._pbar else None
             try:
                 state.images = self._sample_images(state.class_name)
                 if not state.images.inspect:
                     state.failed = True
                     continue
-                state.result.baseline_results = self._run_baseline_inner(
+                state.result.baseline_results = self._classify_inspect_images(
                     state.class_name, state.images, state.class_dir,
                 )
             except Exception as e:
                 logger.error("Baseline failed for %s: %s", state.class_name, e)
                 state.failed = True
-        self.models.offload_classifier()
+
+    def _phase2b_negative_sampling(self, active: list[BatchClassState]):
+        """Phase 2b: Find confusing classes from all predictions, sample negatives."""
+        active = [s for s in active if not s.failed]
+        for i, state in enumerate(active):
+            label = f"  Negatives [{i+1}/{len(active)}] {state.class_name}"
+            self._pbar.set_postfix_str(label.strip()) if self._pbar else None
+            try:
+                self._sample_and_classify_negatives(state)
+            except Exception as e:
+                logger.warning("Negative sampling failed for %s: %s", state.class_name, e)
+
+    def _sample_and_classify_negatives(self, state: BatchClassState):
+        """Sample negatives from confusing classes found in baseline predictions."""
+        confusing = self._find_confusing_from_baseline(
+            state.class_name, state.result.baseline_results,
+        )
+        state.images.confusing_classes = confusing
+        sampler = self.models.sampler()
+        state.images.negative = sampler.sample_from_classes(
+            confusing, n_per_class=self.cfg.negative_samples_per_class,
+        )
+        neg_records = self._classify_negative_images(
+            state.class_name, state.images, state.class_dir,
+        )
+        state.result.baseline_results += neg_records
+
+    def _find_confusing_from_baseline(
+        self, class_name: str, baseline_results: list[dict],
+    ) -> list[str]:
+        """Extract confusing classes from all baseline top-k predictions."""
+        counts: dict[str, float] = {}
+        for record in baseline_results:
+            if record.get("type") != "positive":
+                continue
+            for label, conf in record.get("top_k", []):
+                if label.lower() != class_name.lower() and conf > self.cfg.confusing_class_min_conf:
+                    counts[label] = counts.get(label, 0) + conf
+        sorted_classes = sorted(counts.items(), key=lambda x: -x[1])
+        return [label for label, _ in sorted_classes[:self.cfg.top_negative_classes]]
 
     def _phase3_vlm_features_edits(self, states: list[BatchClassState]):
         """Phase 3: VLM discovers features and generates edit instructions."""
         self.models.vlm()
         active = self._active_states(states)
-        for state in tqdm(active, desc="  Features+edits", leave=False, unit="cls"):
+        for i, state in enumerate(active):
+            label = f"  Features+edits [{i+1}/{len(active)}] {state.class_name}"
+            self._pbar.set_postfix_str(label.strip()) if self._pbar else None
             try:
                 discovered = self._discover_image_features(
                     state.class_name, state.images, state.result.baseline_results,
@@ -457,14 +527,33 @@ class AnalysisPipeline:
         """Phase 4: Editor generates all edited images, saved to disk."""
         self.models.editor()
         active = self._active_states(states)
-        for state in tqdm(active, desc="  Generate edits", leave=False, unit="cls"):
-            state.pending = self._generate_all_variants(state)
+        total_edits = sum(len(s.edit_inputs) for s in active)
+        total_imgs = total_edits * self.cfg.generations_per_edit
+        img_bar = tqdm(total=total_imgs, desc="    Generating images", leave=False, unit="img")
+        for i, state in enumerate(active):
+            img_bar.set_description(f"    {state.class_name}: Generating images")
+            state.pending = self._generate_all_variants_tracked(state, img_bar)
+        img_bar.close()
         self.models.offload_editor()
 
     def _generate_all_variants(self, state: BatchClassState) -> list[PendingGeneration]:
         """Generate all edit variants for one class using the editor."""
         total = len(state.edit_inputs) * self.cfg.generations_per_edit
-        pbar = tqdm(total=total, desc="    Variants", leave=False, unit="img")
+        pbar = tqdm(total=total, desc=f"    {state.class_name}: Variants", leave=False, unit="img")
+        pending = self._generate_variants_loop(state, pbar)
+        pbar.close()
+        return pending
+
+    def _generate_all_variants_tracked(
+        self, state: BatchClassState, pbar: tqdm,
+    ) -> list[PendingGeneration]:
+        """Generate all edit variants, updating an external progress bar."""
+        return self._generate_variants_loop(state, pbar)
+
+    def _generate_variants_loop(
+        self, state: BatchClassState, pbar: tqdm,
+    ) -> list[PendingGeneration]:
+        """Core loop: generate variants and update the given progress bar."""
         pending = []
         for j, inp in enumerate(state.edit_inputs):
             ctx = self._make_edit_context(
@@ -477,19 +566,22 @@ class AnalysisPipeline:
                 if result:
                     pending.append(result)
                 pbar.update(1)
-        pbar.close()
         return pending
 
     def _phase5_classifier_measure(self, states: list[BatchClassState]):
         """Phase 5: Classifier measures impact of all edits."""
         self.models.classifier()
         active = self._active_states(states)
-        for state in tqdm(active, desc="  Measure impact", leave=False, unit="cls"):
+        total_pending = sum(len(s.pending) for s in active)
+        img_bar = tqdm(total=total_pending, desc="    Classifying edits", leave=False, unit="img")
+        for i, state in enumerate(active):
+            img_bar.set_description(f"    {state.class_name}: Classifying edits")
             try:
-                state.result.edit_results = self._classify_all_variants(state)
+                state.result.edit_results = self._classify_all_variants_tracked(state, img_bar)
             except Exception as e:
                 logger.error("Classification failed for %s: %s", state.class_name, e)
                 state.failed = True
+        img_bar.close()
         self.models.offload_classifier()
 
     def _classify_all_variants(self, state: BatchClassState) -> list[EditResult]:
@@ -498,12 +590,23 @@ class AnalysisPipeline:
         grouped = self._group_classified_generations(state)
         return self._assemble_edit_results(state, grouped)
 
+    def _classify_all_variants_tracked(
+        self, state: BatchClassState, pbar: tqdm,
+    ) -> list[EditResult]:
+        """Classify all pending variants, updating an external progress bar."""
+        self._attach_original_gradcams(state.edit_inputs, state.class_name)
+        grouped = self._group_classified_generations(state, pbar)
+        return self._assemble_edit_results(state, grouped)
+
     def _group_classified_generations(
-        self, state: BatchClassState,
+        self, state: BatchClassState, pbar: tqdm | None = None,
     ) -> dict[int, list[GenerationResult]]:
         """Classify each pending variant and group by edit index."""
         grouped: dict[int, list[GenerationResult]] = {}
-        for p in tqdm(state.pending, desc="    Classify", leave=False, unit="img"):
+        own_bar = pbar is None
+        if own_bar:
+            pbar = tqdm(total=len(state.pending), desc=f"    {state.class_name}: Classify", leave=False, unit="img")
+        for p in state.pending:
             inp = state.edit_inputs[p.edit_input_idx]
             ctx = self._make_edit_context(
                 state.class_name, state.class_dir, inp.instruction,
@@ -512,6 +615,9 @@ class AnalysisPipeline:
             gen = self._classify_saved_variant(p, inp, ctx)
             if gen:
                 grouped.setdefault(p.edit_input_idx, []).append(gen)
+            pbar.update(1)
+        if own_bar:
+            pbar.close()
         return grouped
 
     def _assemble_edit_results(
@@ -556,7 +662,9 @@ class AnalysisPipeline:
         """Phase 6: VLM classifies features and runs final analysis."""
         self.models.vlm()
         active = self._active_states(states)
-        for state in tqdm(active, desc="  Final analysis", leave=False, unit="cls"):
+        for i, state in enumerate(active):
+            label = f"  Final [{i+1}/{len(active)}] {state.class_name}"
+            self._pbar.set_postfix_str(label.strip()) if self._pbar else None
             try:
                 self._finalize_class_batch(state)
             except Exception as e:
@@ -652,22 +760,17 @@ class AnalysisPipeline:
             return []
 
     def _sample_images(self, class_name: str) -> ImageSet:
-        """Sample positive, edit, and negative images for analysis."""
+        """Sample positive images for analysis (negatives added after baseline)."""
         sampler = self.models.sampler()
-        all_positives = sampler.sample_positive(
-            class_name, n=max(self.cfg.inspect_samples, self.cfg.samples_per_class)
-        )
+        effective_inspect = max(self.cfg.inspect_samples, self.cfg.samples_per_class)
+        all_positives = sampler.sample_positive(class_name, n=effective_inspect)
         if not all_positives:
             return ImageSet()
 
-        images = ImageSet(
-            inspect=all_positives[:self.cfg.inspect_samples],
+        return ImageSet(
+            inspect=all_positives[:effective_inspect],
             edit=all_positives[:self.cfg.samples_per_class],
         )
-        confusing = self._find_confusing_classes(class_name, images.edit)
-        images.confusing_classes = confusing
-        images.negative = sampler.sample_from_classes(confusing, n_per_class=1)
-        return images
 
     def _find_confusing_classes(self, class_name: str, edit_images: list) -> list[str]:
         """Combine classifier and VLM confusing classes."""
@@ -675,7 +778,7 @@ class AnalysisPipeline:
         classifier_classes = self._classifier_confusing_classes(class_name, edit_images)
         vlm_classes = self._vlm_confusing_classes(class_name)
         merged = self._merge_confusing_classes(classifier_classes, vlm_classes)
-        return merged[:self.cfg.negative_samples]
+        return merged[:self.cfg.top_negative_classes]
 
     def _classifier_confusing_classes(self, class_name: str, edit_images: list) -> list[str]:
         """Get confusing classes from classifier predictions."""
@@ -699,7 +802,7 @@ class AnalysisPipeline:
         all_classes = self.models.sampler().get_label_names()
         try:
             candidates = self.models.vlm().select_confusing_classes(
-                class_name, all_classes, num_classes=self.cfg.negative_samples
+                class_name, all_classes, num_classes=self.cfg.top_negative_classes
             )
             return self._validate_class_names(candidates)
         except Exception as e:
@@ -729,17 +832,18 @@ class AnalysisPipeline:
         return valid
 
     def _run_baseline(self, class_name: str, images: ImageSet, class_dir: Path) -> list[dict]:
-        """Run baseline classification with Grad-CAM on all images."""
+        """Run baseline: classify positives, find confusing classes, classify negatives."""
         self.models.classifier()
         self._status("Running baseline + Grad-CAM...")
-        result = self._run_baseline_inner(class_name, images, class_dir)
-        self.models.offload_classifier()
-        return result
-
-    def _run_baseline_inner(self, class_name: str, images: ImageSet, class_dir: Path) -> list[dict]:
-        """Baseline classification without model lifecycle management."""
         inspect_records = self._classify_inspect_images(class_name, images, class_dir)
+        confusing = self._find_confusing_from_baseline(class_name, inspect_records)
+        images.confusing_classes = confusing
+        sampler = self.models.sampler()
+        images.negative = sampler.sample_from_classes(
+            confusing, n_per_class=self.cfg.negative_samples_per_class,
+        )
         neg_records = self._classify_negative_images(class_name, images, class_dir)
+        self.models.offload_classifier()
         return inspect_records + neg_records
 
     def _classify_inspect_images(self, class_name: str, images: ImageSet, class_dir: Path) -> list[dict]:
@@ -748,7 +852,7 @@ class AnalysisPipeline:
         records = []
         for i, (img, true_label) in tqdm(
             enumerate(images.inspect), total=len(images.inspect),
-            desc="    Inspect+GradCAM", leave=False, unit="img",
+            desc=f"    {class_name}: Inspect+GradCAM", leave=False, unit="img",
         ):
             pred = clf.predict(img, target_class_name=class_name, top_k=self.cfg.top_k_classes, compute_gradcam=True)
             conf = clf.get_class_confidence(img, class_name)
@@ -766,7 +870,7 @@ class AnalysisPipeline:
         records = []
         for i, (img, true_label) in tqdm(
             enumerate(images.negative), total=len(images.negative),
-            desc="    Negatives", leave=False, unit="img",
+            desc=f"    {class_name}: Negatives", leave=False, unit="img",
         ):
             pred = clf.predict(img, target_class_name=class_name, top_k=self.cfg.top_k_classes, compute_gradcam=False)
             conf = clf.get_class_confidence(img, class_name)
@@ -802,10 +906,11 @@ class AnalysisPipeline:
         """Analyze images with Grad-CAM to discover visual features."""
         vlm = self.models.vlm()
         result = DiscoveredFeatures()
-        for idx, (img, pred, _) in tqdm(
-            enumerate(images.annotated_inspect), total=len(images.annotated_inspect),
-            desc="    Discover features", leave=False, unit="img",
-        ):
+        pbar = tqdm(
+            total=len(images.annotated_inspect),
+            desc=f"    {class_name}: Discover features", leave=False, unit="img",
+        )
+        for idx, (img, pred, _) in enumerate(images.annotated_inspect):
             if pred.gradcam_image:
                 conf = baseline[idx]["class_confidence"]
                 try:
@@ -813,6 +918,11 @@ class AnalysisPipeline:
                     self._accumulate_discovery(discovery, idx, result)
                 except Exception as e:
                     logger.warning("Feature discovery failed for image %d: %s", idx, e)
+            n_feat = len(result.detected)
+            n_essential = len(result.essential)
+            pbar.set_postfix_str(f"{n_feat} features, {n_essential} essential")
+            pbar.update(1)
+        pbar.close()
         result.detected = self._deduplicate_features_by_name(result.detected)
         return result
 
@@ -882,16 +992,22 @@ class AnalysisPipeline:
         vlm = self.models._vlm
         features = self._to_detected_features(self._current_detected[:10])
         inputs = []
-        for idx, (img, pred, _) in tqdm(
-            enumerate(positives), total=len(positives),
-            desc="    Positive edits", leave=False, unit="img",
-        ):
+        pbar = tqdm(
+            total=len(positives),
+            desc=f"    {class_name}: Positive edits", leave=False, unit="img",
+        )
+        for idx, (img, pred, _) in enumerate(positives):
             conf = baseline[idx]["class_confidence"]
             try:
                 edits = vlm.generate_feature_edits(img, features, class_name)
-                inputs += self._wrap_positive_edits(img, edits, conf, idx)
+                new_edits = self._wrap_positive_edits(img, edits, conf, idx)
+                inputs += new_edits
+                pbar.set_postfix_str(f"{len(inputs)} edits total, {len(new_edits)} this img")
             except Exception as e:
                 logger.warning("Edit generation failed for image %d: %s", idx, e)
+                pbar.set_postfix_str(f"{len(inputs)} edits total, 0 this img")
+            pbar.update(1)
+        pbar.close()
         return inputs
 
     def _wrap_positive_edits(self, img, edits, conf: float, idx: int) -> list[EditInput]:
@@ -914,12 +1030,17 @@ class AnalysisPipeline:
         inputs = []
         inspect_count = len(images.annotated_inspect)
         negatives = images.annotated_negatives[:self.cfg.max_edits_per_hypothesis]
-        for i, (img, pred, true_label) in tqdm(
-            enumerate(negatives), total=len(negatives),
-            desc="    Negative edits", leave=False, unit="img",
-        ):
+        pbar = tqdm(
+            total=len(negatives),
+            desc=f"    {class_name}: Negative edits", leave=False, unit="img",
+        )
+        for i, (img, pred, true_label) in enumerate(negatives):
             sample = NegativeSample(img, class_name, true_label, baseline[inspect_count + i]["class_confidence"], i)
-            inputs += self._analyze_one_negative(sample)
+            new_edits = self._analyze_one_negative(sample)
+            inputs += new_edits
+            pbar.set_postfix_str(f"{len(inputs)} edits total, {len(new_edits)} this img")
+            pbar.update(1)
+        pbar.close()
         return inputs
 
     def _analyze_one_negative(self, sample: NegativeSample) -> list[EditInput]:
@@ -1274,25 +1395,43 @@ class AnalysisPipeline:
             self._pbar.set_postfix_str(msg, refresh=True)
 
     def _deduplicate_inputs(self, inputs: list[EditInput]) -> list[EditInput]:
-        """Remove duplicate edit instructions based on text similarity."""
+        """Remove duplicate edit instructions within the same image."""
         if not inputs:
             return inputs
-        threshold = self.cfg.dedup_similarity_threshold
-
-        def normalize(text: str) -> str:
-            return ' '.join(re.sub(r'[^\w\s]', '', text.lower()).split())
-
-        deduplicated = []
-        seen: list[str] = []
-        for inp in inputs:
-            norm = normalize(inp.instruction.edit)
-            is_dup = any(SequenceMatcher(None, norm, normalize(s)).ratio() >= threshold for s in seen)
-            if not is_dup:
-                deduplicated.append(inp)
-                seen.append(inp.instruction.edit)
+        by_image = self._group_inputs_by_image(inputs)
+        deduplicated = self._dedup_per_image(by_image)
         if len(deduplicated) < len(inputs):
-            logger.debug("Deduplicated %d -> %d edits", len(inputs), len(deduplicated))
+            logger.debug("Deduplicated %d -> %d edits (per-image)", len(inputs), len(deduplicated))
         return deduplicated
+
+    def _group_inputs_by_image(self, inputs: list[EditInput]) -> dict[int, list[EditInput]]:
+        """Group edit inputs by their source image index."""
+        by_image: dict[int, list[EditInput]] = {}
+        for inp in inputs:
+            by_image.setdefault(inp.instruction.image_index, []).append(inp)
+        return by_image
+
+    def _dedup_per_image(self, by_image: dict[int, list[EditInput]]) -> list[EditInput]:
+        """Deduplicate edits within each image group."""
+        threshold = self.cfg.dedup_similarity_threshold
+        deduplicated = []
+        for group in by_image.values():
+            seen: list[str] = []
+            for inp in group:
+                norm = self._normalize_edit_text(inp.instruction.edit)
+                is_dup = any(
+                    SequenceMatcher(None, norm, s).ratio() >= threshold
+                    for s in seen
+                )
+                if not is_dup:
+                    deduplicated.append(inp)
+                    seen.append(norm)
+        return deduplicated
+
+    @staticmethod
+    def _normalize_edit_text(text: str) -> str:
+        """Normalize edit instruction text for comparison."""
+        return ' '.join(re.sub(r'[^\w\s]', '', text.lower()).split())
 
     def _validate_direction(self, instr: EditInstruction, delta: float) -> bool:
         """Check if confidence change matches expected direction."""

@@ -9,9 +9,25 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 from jinja2 import Template
 
 logger = logging.getLogger(__name__)
+
+
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that converts numpy types to native Python types."""
+
+    def default(self, obj):
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
 
 
 def _get_feature_display_name(edit_result: dict) -> str:
@@ -265,6 +281,22 @@ document.addEventListener('DOMContentLoaded', function() {
       <div class="label">High Risk Classes</div>
     </div>
   </div>
+
+  {% if config and config.timing %}
+  {% set t = config.timing %}
+  {% set dur = t.duration_seconds %}
+  {% set hours = dur // 3600 %}
+  {% set minutes = (dur % 3600) // 60 %}
+  {% set seconds = dur % 60 %}
+  <div class="info-box" style="margin: 20px 0;">
+    <h3 style="margin-top: 0;">Execution Timing</h3>
+    <table>
+      <tr><td style="width: 30%;"><strong>Started</strong></td><td>{{ t.start }}</td></tr>
+      <tr><td><strong>Finished</strong></td><td>{{ t.end }}</td></tr>
+      <tr><td><strong>Duration</strong></td><td>{% if hours > 0 %}{{ hours }}h {{ minutes }}m {{ seconds }}s{% elif minutes > 0 %}{{ minutes }}m {{ seconds }}s{% else %}{{ seconds }}s{% endif %}</td></tr>
+    </table>
+  </div>
+  {% endif %}
 
   <h3>Class Summary</h3>
   <table>
@@ -1109,11 +1141,13 @@ document.addEventListener('DOMContentLoaded', function() {
   <h3>Configuration</h3>
   <table>
     <tr><th style="width: 30%;">Parameter</th><th>Value</th></tr>
+    <tr><td><strong>Dataset</strong></td><td>{{ config.hf_dataset if config else 'ILSVRC/imagenet-1k' }} ({{ config.hf_dataset_split if config else 'validation' }})</td></tr>
     <tr><td><strong>Classifier Model</strong></td><td>{{ config.classifier_model if config else 'ResNet-50 (ImageNet-1k)' }}</td></tr>
     <tr><td><strong>Vision-Language Model (VLM)</strong></td><td>{{ config.vlm_model if config else 'Qwen/Qwen2.5-VL-7B-Instruct' }}</td></tr>
     <tr><td><strong>Image Editor Model</strong></td><td>{{ config.editor_model if config else 'Qwen/Qwen-Image-Edit' }}</td></tr>
     <tr><td><strong>Attention Method</strong></td><td>{{ config.attention_method if config else 'Score-CAM' }}</td></tr>
-    <tr><td><strong>Samples per Class</strong></td><td>{{ config.samples_per_class if config else '5' }} positive, {{ config.negative_samples if config else '5' }} negative</td></tr>
+    <tr><td><strong>Positive Samples</strong></td><td>{{ config.samples_per_class if config else '25' }}</td></tr>
+    <tr><td><strong>Negative Classes</strong></td><td>{{ config.top_negative_classes if config else '5' }} classes, {{ config.negative_samples_per_class if config else '5' }} images each</td></tr>
     <tr><td><strong>VLM Iterations</strong></td><td>{{ config.iterations if config else '2' }}</td></tr>
     <tr><td><strong>Generations per Edit</strong></td><td>{{ config.generations_per_edit if config else '3' }}</td></tr>
     <tr><td><strong>Confidence Delta Threshold</strong></td><td>{{ config.confidence_delta_threshold if config else '0.15' }}</td></tr>
@@ -1131,7 +1165,7 @@ document.addEventListener('DOMContentLoaded', function() {
     </div>
     <div class="info-box" style="border-left: 4px solid #3498db;">
       <h4 style="margin: 0 0 10px 0;">2. Sample Collection</h4>
-      <p style="margin: 0;">Collect positive samples and negative samples from confusing classes (identified from classifier top-k predictions) from ImageNet validation set.</p>
+      <p style="margin: 0;">Collect positive samples and negative samples from confusing classes (identified from classifier top-k predictions) from {{ config.hf_dataset if config else 'ILSVRC/imagenet-1k' }} {{ config.hf_dataset_split if config else 'validation' }} set.</p>
     </div>
     <div class="info-box" style="border-left: 4px solid #9b59b6;">
       <h4 style="margin: 0 0 10px 0;">3. Baseline Classification</h4>
@@ -1229,7 +1263,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
 _MD_TEMPLATE = """# Classification Model Bias Analysis Report
 
-**Model**: ResNet-50 (ImageNet-1k) | **Classes analyzed**: {{ results|length }}
+**Model**: {{ config.classifier_model if config else 'ResNet-50 (ImageNet-1k)' }} | **Dataset**: {{ config.hf_dataset if config else 'ILSVRC/imagenet-1k' }} ({{ config.hf_dataset_split if config else 'validation' }}) | **Classes analyzed**: {{ results|length }}
 
 ## Overall Summary
 
@@ -1394,7 +1428,7 @@ class Reporter:
         path = self.output_dir / "analysis_results.json"
         # Keep absolute paths in JSON for programmatic access
         with open(path, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, cls=_NumpyEncoder)
         logger.info("Saved consolidated JSON: %s", path)
         return path
 
@@ -1412,7 +1446,7 @@ class Reporter:
         path = self.output_dir / "report.md"
         # Use relative paths for Markdown too
         relative_results = self._convert_paths_to_relative(results)
-        md = Template(_MD_TEMPLATE).render(results=relative_results)
+        md = Template(_MD_TEMPLATE).render(results=relative_results, config=self.config)
         path.write_text(md, encoding="utf-8")
         logger.info("Saved Markdown report: %s", path)
         return path

@@ -121,10 +121,10 @@ class StatisticalValidator:
         effect_interpretation = self._interpret_cohens_d(cohens_d)
 
         # Statistical significance
-        statistically_significant = p_value < self.alpha
+        statistically_significant = bool(p_value < self.alpha)
 
         # Practical significance (effect size)
-        practically_significant = cohens_d >= self.min_effect_size
+        practically_significant = bool(cohens_d >= self.min_effect_size)
 
         # Direction check
         direction_correct = (
@@ -134,7 +134,7 @@ class StatisticalValidator:
         )
 
         # Final confirmation: must be statistically significant, practically significant, and correct direction
-        confirmed = statistically_significant and practically_significant and direction_correct
+        confirmed = bool(statistically_significant and practically_significant and direction_correct)
 
         return StatisticalResult(
             mean_delta=mean_delta,
@@ -180,8 +180,8 @@ class StatisticalValidator:
         if correction == "bonferroni":
             corrected_alpha = self.alpha / len(results)
             for r in results:
-                r.statistically_significant = r.p_value < corrected_alpha
-                r.confirmed = r.statistically_significant and r.practically_significant
+                r.statistically_significant = bool(r.p_value < corrected_alpha)
+                r.confirmed = bool(r.statistically_significant and r.practically_significant)
 
         elif correction == "holm":
             # Holm-Bonferroni method (step-down)
@@ -189,8 +189,8 @@ class StatisticalValidator:
             n = len(p_values)
             for rank, idx in enumerate(sorted_indices):
                 corrected_alpha = self.alpha / (n - rank)
-                results[idx].statistically_significant = p_values[idx] < corrected_alpha
-                results[idx].confirmed = (
+                results[idx].statistically_significant = bool(p_values[idx] < corrected_alpha)
+                results[idx].confirmed = bool(
                     results[idx].statistically_significant and
                     results[idx].practically_significant
                 )

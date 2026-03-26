@@ -26,5 +26,12 @@ models/
 .vscode/
 *.swp
 
+# Coverage
+.coverage
+htmlcov/
+
+# Archives
+output.zip
+
 # OS
 .DS_Store

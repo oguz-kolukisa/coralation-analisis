@@ -8,8 +8,8 @@ import pytest
 
 from src.config import Config
 from src.pipeline import (
-    AnalysisPipeline, DiscoveredFeatures, EditInput, EditResult,
-    GenerationResult,
+    AnalysisPipeline, DiscoveredFeatures, EditInput, EditInstruction,
+    EditResult, GenerationResult,
 )
 from tests.conftest import make_edit_result, make_generation, make_image, make_instruction
 
@@ -113,6 +113,47 @@ class TestDeduplicateInputs:
         inputs = [self._make_input("Remove the ears!"), self._make_input("Remove the ears")]
         result = pipeline._deduplicate_inputs(inputs)
         assert len(result) == 1
+
+    def _make_input_with_image(self, edit_text, image_index):
+        img = make_image()
+        instr = EditInstruction(
+            edit=edit_text, hypothesis="Test", type="feature_removal",
+            target="positive", priority=3, image_index=image_index,
+        )
+        return EditInput(img, instr, 0.9)
+
+    def test_same_edit_different_images_both_kept(self, pipeline):
+        inputs = [
+            self._make_input_with_image("Remove the ears", 0),
+            self._make_input_with_image("Remove the ears", 1),
+        ]
+        result = pipeline._deduplicate_inputs(inputs)
+        assert len(result) == 2
+
+    def test_same_edit_same_image_deduplicated(self, pipeline):
+        inputs = [
+            self._make_input_with_image("Remove the ears", 0),
+            self._make_input_with_image("Remove the ears", 0),
+        ]
+        result = pipeline._deduplicate_inputs(inputs)
+        assert len(result) == 1
+
+    def test_different_edits_same_image_both_kept(self, pipeline):
+        inputs = [
+            self._make_input_with_image("Remove the ears", 0),
+            self._make_input_with_image("Replace background with white", 0),
+        ]
+        result = pipeline._deduplicate_inputs(inputs)
+        assert len(result) == 2
+
+    def test_similar_edits_across_images_kept(self, pipeline):
+        inputs = [
+            self._make_input_with_image("Remove the pointed ears", 0),
+            self._make_input_with_image("Remove pointed ears", 1),
+            self._make_input_with_image("Remove the pointed ears", 2),
+        ]
+        result = pipeline._deduplicate_inputs(inputs)
+        assert len(result) == 3
 
 
 # =========================================================================
@@ -354,3 +395,53 @@ class TestBaseRecord:
         record = pipeline._base_record("/p.jpg", "tabby cat", pred, 0.3)
         assert record["predicted_label"] == "tiger cat"
         assert record["true_label"] == "tabby cat"
+
+
+# =========================================================================
+# _find_confusing_from_baseline
+# =========================================================================
+
+class TestFindConfusingFromBaseline:
+    def test_extracts_top_confusing_classes(self, pipeline):
+        baseline = [
+            {"type": "positive", "top_k": [("cat", 0.8), ("dog", 0.1), ("lion", 0.05)]},
+            {"type": "positive", "top_k": [("cat", 0.7), ("dog", 0.2), ("tiger", 0.05)]},
+        ]
+        result = pipeline._find_confusing_from_baseline("cat", baseline)
+        assert result[0] == "dog"  # highest cumulative confidence
+
+    def test_ignores_target_class(self, pipeline):
+        baseline = [
+            {"type": "positive", "top_k": [("cat", 0.9), ("dog", 0.05)]},
+        ]
+        result = pipeline._find_confusing_from_baseline("cat", baseline)
+        assert "cat" not in result
+
+    def test_ignores_negative_records(self, pipeline):
+        baseline = [
+            {"type": "positive", "top_k": [("cat", 0.8), ("dog", 0.1)]},
+            {"type": "negative", "top_k": [("cat", 0.3), ("fish", 0.5)]},
+        ]
+        result = pipeline._find_confusing_from_baseline("cat", baseline)
+        assert "fish" not in result
+
+    def test_empty_baseline(self, pipeline):
+        assert pipeline._find_confusing_from_baseline("cat", []) == []
+
+    def test_respects_min_confidence(self, pipeline):
+        pipeline.cfg.confusing_class_min_conf = 0.10
+        baseline = [
+            {"type": "positive", "top_k": [("cat", 0.9), ("dog", 0.05)]},
+        ]
+        result = pipeline._find_confusing_from_baseline("cat", baseline)
+        assert "dog" not in result  # 0.05 < threshold 0.10
+
+    def test_limits_to_top_negative_classes(self, pipeline):
+        pipeline.cfg.top_negative_classes = 2
+        baseline = [
+            {"type": "positive", "top_k": [
+                ("cat", 0.5), ("dog", 0.2), ("lion", 0.15), ("tiger", 0.1),
+            ]},
+        ]
+        result = pipeline._find_confusing_from_baseline("cat", baseline)
+        assert len(result) <= 2

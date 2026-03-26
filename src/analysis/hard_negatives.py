@@ -63,6 +63,7 @@ class HardNegativeMiner:
             List of HardNegative samples, sorted by target confidence (highest first)
         """
         hard_negatives: list[HardNegative] = []
+        i = -1
 
         for i, (img, true_label) in enumerate(images):
             if i >= max_scan:

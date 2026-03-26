@@ -240,14 +240,21 @@ class TestClassifySavedVariant:
 # Inner methods (model-management-free)
 # =========================================================================
 
-class TestRunBaselineInner:
+class TestRunBaseline:
     def test_combines_inspect_and_negative_records(self, pipeline):
-        with patch.object(pipeline, "_classify_inspect_images", return_value=[{"type": "pos"}]):
-            with patch.object(pipeline, "_classify_negative_images", return_value=[{"type": "neg"}]):
-                result = pipeline._run_baseline_inner("cat", ImageSet(), Path("/tmp"))
+        pipeline.models.classifier = MagicMock()
+        pipeline.models.offload_classifier = MagicMock()
+        pipeline.models.sampler.return_value.sample_from_classes.return_value = []
+        pipeline._status = MagicMock()
+        with patch.object(pipeline, "_classify_inspect_images", return_value=[
+            {"type": "positive", "top_k": [("dog", 0.3)]}
+        ]):
+            with patch.object(pipeline, "_classify_negative_images", return_value=[{"type": "negative"}]):
+                with patch.object(pipeline, "_find_confusing_from_baseline", return_value=["dog"]):
+                    result = pipeline._run_baseline("cat", ImageSet(), Path("/tmp"))
         assert len(result) == 2
-        assert result[0]["type"] == "pos"
-        assert result[1]["type"] == "neg"
+        assert result[0]["type"] == "positive"
+        assert result[1]["type"] == "negative"
 
 
 class TestGenerateEditInstructionsInner:

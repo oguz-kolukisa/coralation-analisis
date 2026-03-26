@@ -2,6 +2,7 @@
 Configuration for the Coralation analysis pipeline.
 """
 from __future__ import annotations
+import json
 from pathlib import Path
 from pydantic import BaseModel, Field
 
@@ -28,31 +29,16 @@ def load_hf_token(token_file: Path = _TOKEN_FILE) -> str | None:
     return os.environ.get("HF_TOKEN")
 
 
-# Default ImageNet classes to analyze (20 classes)
-DEFAULT_CLASSES = [
-    "tabby cat",
-    "golden retriever",
-    "sports car",
-    "African elephant",
-    "daisy",
-    "school bus",
-    "acoustic guitar",
-    "hamburger",
-    "pizza",
-    "broccoli",
-    "laptop",
-    "teddy bear",
-    "zebra",
-    "fire truck",
-    "mushroom",
-    "lighthouse",
-    "violin",
-    "bee",
-    "parachute",
-    "canoe",
-]
-
 # ImageNet-1k class name → HuggingFace label index mapping is resolved at runtime.
+
+_DEFAULT_CLASS_FILE = Path(__file__).parent / "imagenet100_classes.json"
+
+
+def load_classes_from_file(path: Path) -> list[str]:
+    """Load class names from a JSON file (synset_id → label mapping)."""
+    with open(path) as f:
+        mapping = json.load(f)
+    return list(mapping.values())
 
 
 class Config(BaseModel):
@@ -64,11 +50,15 @@ class Config(BaseModel):
     # --- Dataset settings ---
     hf_dataset: str = "ILSVRC/imagenet-1k"
     hf_dataset_split: str = "validation"
-    samples_per_class: int = 5          # positive examples per class (for EDITING)
+    class_source: str = "json"          # "json" = read from file, "dataset" = query dataset labels
+    class_file: Path = _DEFAULT_CLASS_FILE  # path to JSON class list (used when class_source="json")
+    samples_per_class: int = 100        # positive examples per class (for EDITING)
     inspect_samples: int = 10           # images to INSPECT for feature discovery (separate from editing)
-    negative_samples: int = 5           # negative examples (other classes) per class
+    top_negative_classes: int = 5       # how many confusing classes to select
+    negative_samples_per_class: int = 5  # negative images to sample from each confusing class
     max_scan: int = 10000               # max samples to scan when searching for a class
     random_seed: int | None = None      # None = random each run, set for reproducibility
+    random_classes: bool = False        # if True, randomly select classes from dataset
 
     # --- Analysis settings ---
     confidence_delta_threshold: float = 0.15   # min delta to "confirm" a hypothesis
@@ -79,7 +69,7 @@ class Config(BaseModel):
     max_edits_per_hypothesis: int = 3           # images to edit per hypothesis
 
     # --- Robustness settings ---
-    generations_per_edit: int = 3               # generate multiple images per edit for robustness
+    generations_per_edit: int = 1               # images generated per edit instruction
 
     # --- Attention map settings ---
     attention_method: str = "scorecam"          # "gradcam", "gradcam++", or "scorecam"

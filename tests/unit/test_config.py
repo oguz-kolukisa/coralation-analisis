@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.config import Config, DEFAULT_CLASSES, get_config, load_hf_token
+from src.config import Config, get_config, load_hf_token
 
 
 # =========================================================================
@@ -25,8 +25,9 @@ class TestConfigDefaults:
 
     def test_default_samples(self):
         cfg = Config()
-        assert cfg.samples_per_class == 5
-        assert cfg.negative_samples == 5
+        assert cfg.samples_per_class == 100
+        assert cfg.top_negative_classes == 5
+        assert cfg.negative_samples_per_class == 5
         assert cfg.inspect_samples == 10
 
     def test_default_thresholds(self):
@@ -55,9 +56,10 @@ class TestConfigOverrides:
         assert cfg.device == "cpu"
 
     def test_override_samples(self):
-        cfg = Config(samples_per_class=10, negative_samples=3)
+        cfg = Config(samples_per_class=10, top_negative_classes=3, negative_samples_per_class=8)
         assert cfg.samples_per_class == 10
-        assert cfg.negative_samples == 3
+        assert cfg.top_negative_classes == 3
+        assert cfg.negative_samples_per_class == 8
 
     def test_override_output_dir(self):
         cfg = Config(output_dir=Path("/tmp/custom"))
@@ -151,13 +153,14 @@ class TestLoadHfToken:
 
 
 # =========================================================================
-# DEFAULT_CLASSES
+# random_classes config field
 # =========================================================================
 
-class TestDefaultClasses:
-    def test_has_expected_count(self):
-        assert len(DEFAULT_CLASSES) == 20
+class TestRandomClassesConfig:
+    def test_default_is_false(self):
+        cfg = Config()
+        assert cfg.random_classes is False
 
-    def test_contains_expected_entries(self):
-        assert "tabby cat" in DEFAULT_CLASSES
-        assert "sports car" in DEFAULT_CLASSES
+    def test_override_to_true(self):
+        cfg = Config(random_classes=True)
+        assert cfg.random_classes is True

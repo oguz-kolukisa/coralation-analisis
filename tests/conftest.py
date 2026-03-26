@@ -8,6 +8,16 @@ from unittest.mock import MagicMock
 import pytest
 from PIL import Image
 
+
+def pytest_addoption(parser):
+    """Register --gpu command-line flag."""
+    parser.addoption(
+        "--gpu",
+        action="store_true",
+        default=False,
+        help="Run GPU integration tests (requires CUDA and model weights)",
+    )
+
 from src.config import Config
 from src.pipeline import (
     ClassAnalysisResult, EditContext, EditInput, EditResult,

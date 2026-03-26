@@ -2,8 +2,8 @@
 CLI entry point for the Coralation image classification analysis tool.
 
 Usage:
-    uv run python main.py                        # analyze 10 default classes
-    uv run python main.py --classes 5            # analyze first 5 default classes
+    uv run python main.py                        # analyze 30 default classes
+    uv run python main.py --classes 5            # analyze first 5 classes
     uv run python main.py --class-names "cat" "dog"   # specific classes
     uv run python main.py --all                  # analyze all 1000 ImageNet classes
     uv run python main.py --output-dir ./results --samples 3
@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore", message=".*torch.cuda.amp.autocast.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
-from src.config import Config, DEFAULT_CLASSES, load_hf_token
+from src.config import Config, load_hf_token, load_classes_from_file
 from src.pipeline import AnalysisPipeline
 from src.reporter import Reporter
 
@@ -118,6 +118,33 @@ def setup_logging(level: str = "INFO", debug: bool = False, verbose: bool = Fals
         pass
 
 
+def resolve_classes(args, pipeline, cfg):
+    """Determine which classes to analyze based on CLI arguments."""
+    if args.class_names:
+        return args.class_names
+    all_names = _load_all_class_names(pipeline, cfg)
+    if args.all:
+        return all_names
+    return _select_n_classes(all_names, args.classes, cfg)
+
+
+def _load_all_class_names(pipeline, cfg):
+    """Load class names from JSON file or dataset based on config."""
+    if cfg.class_source == "json":
+        return load_classes_from_file(cfg.class_file)
+    return pipeline.models.sampler().get_label_names()
+
+
+def _select_n_classes(all_names, n, cfg):
+    """Select N classes from the full list, optionally randomized."""
+    import random
+    if not cfg.random_classes:
+        return all_names[:n]
+    seed = cfg.random_seed if cfg.random_seed is not None else random.randrange(2**32)
+    rng = random.Random(seed)
+    return rng.sample(all_names, min(n, len(all_names)))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Coralation: Automated bias/shortcut discovery for image classifiers"
@@ -126,8 +153,8 @@ def main():
     # Class selection
     class_group = parser.add_mutually_exclusive_group()
     class_group.add_argument(
-        "--classes", type=int, default=20,
-        help="Number of default ImageNet classes to analyze (default: 20)"
+        "--classes", type=int, default=100,
+        help="Number of ImageNet-100 classes to analyze (default: 100)"
     )
     class_group.add_argument(
         "--class-names", nargs="+", metavar="CLASS",
@@ -135,22 +162,36 @@ def main():
     )
     class_group.add_argument(
         "--all", action="store_true",
-        help="Analyze all 1000 ImageNet classes (very slow)"
+        help="Analyze all 100 ImageNet-100 classes"
+    )
+
+    # Class source
+    parser.add_argument(
+        "--class-source", choices=["json", "dataset"], default="json",
+        help="Where to read class names: 'json' from file or 'dataset' from HF dataset (default: json)"
+    )
+    parser.add_argument(
+        "--class-file", type=str, default=None,
+        help="Path to JSON class list file (default: src/imagenet100_classes.json)"
     )
 
     # Config overrides
     parser.add_argument("--output-dir", default="output", help="Output directory")
     parser.add_argument(
-        "--samples", type=int, default=5,
-        help="Number of positive samples per class to EDIT (default: 5)"
+        "--samples", type=int, default=100,
+        help="Number of positive samples per class to EDIT (default: 100)"
     )
     parser.add_argument(
         "--inspect-samples", type=int, default=10,
         help="Number of images to INSPECT for feature discovery (default: 10, separate from editing)"
     )
     parser.add_argument(
+        "--top-negative-classes", type=int, default=5,
+        help="Number of confusing classes to select (default: 5)"
+    )
+    parser.add_argument(
         "--negative-samples", type=int, default=5,
-        help="Number of negative samples per class (default: 5)"
+        help="Negative images to sample from each confusing class (default: 5)"
     )
     parser.add_argument(
         "--delta-threshold", type=float, default=0.15,
@@ -177,8 +218,8 @@ def main():
         help="Number of VLM analysis iterations per class (default: 2)"
     )
     parser.add_argument(
-        "--generations", type=int, default=3,
-        help="Number of image generations per edit (default: 3)"
+        "--generations", type=int, default=1,
+        help="Number of image generations per edit (default: 1)"
     )
     parser.add_argument(
         "--low-vram", action="store_true", default=True,
@@ -200,6 +241,10 @@ def main():
     parser.add_argument(
         "--verify", action="store_true",
         help="Enable VLM verification of edits (disabled by default, slower)"
+    )
+    parser.add_argument(
+        "--random-classes", action="store_true",
+        help="Randomly select classes from dataset instead of taking first N"
     )
     parser.add_argument("--log-level", default="INFO", help="Console logging level (default: INFO)")
     parser.add_argument(
@@ -226,16 +271,11 @@ def main():
     setup_logging(args.log_level, debug=args.debug, verbose=args.verbose, log_file=args.log_file)
     logger = logging.getLogger("coralation")
 
-    # Determine which classes to analyze
-    if args.class_names:
-        classes = args.class_names
-    elif args.all:
-        classes = None   # signal to expand later
-    else:
-        classes = DEFAULT_CLASSES[: args.classes]
-
     # Build config
     low_vram = not args.high_vram  # --high-vram overrides default low_vram=True
+    class_file_overrides = {}
+    if args.class_file:
+        class_file_overrides["class_file"] = Path(args.class_file)
     cfg = Config(
         classifier_model=args.classifier,
         vlm_model=args.vlm,
@@ -243,7 +283,8 @@ def main():
         output_dir=Path(args.output_dir),
         samples_per_class=args.samples,
         inspect_samples=args.inspect_samples,
-        negative_samples=args.negative_samples,
+        top_negative_classes=args.top_negative_classes,
+        negative_samples_per_class=args.negative_samples,
         confidence_delta_threshold=args.delta_threshold,
         max_hypotheses_per_image=args.max_hypotheses,
         iterations=args.iterations,
@@ -251,8 +292,11 @@ def main():
         low_vram=low_vram,
         attention_method=args.attention,
         use_statistical_validation=not args.no_stats,
+        random_classes=args.random_classes,
         verify_edits=args.verify,
         hf_token=args.hf_token or load_hf_token(),
+        class_source=args.class_source,
+        **class_file_overrides,
     )
 
     # Print header
@@ -261,7 +305,7 @@ def main():
     print("=" * 60)
     print(f"  Output:     {cfg.output_dir}")
     print(f"  Inspect:    {cfg.inspect_samples} images for feature discovery")
-    print(f"  Edit:       {cfg.samples_per_class} positive, {cfg.negative_samples} negative samples")
+    print(f"  Edit:       {cfg.samples_per_class} positive, {cfg.negative_samples_per_class}x{cfg.top_negative_classes} negative samples")
     print(f"  Iterations: {cfg.iterations} per class")
     print(f"  Threshold:  {cfg.confidence_delta_threshold}")
     print(f"  Generations: {cfg.generations_per_edit} per edit")
@@ -273,17 +317,18 @@ def main():
 
     pipeline = AnalysisPipeline(cfg)
 
-    # If --all, get full class list from dataset
-    if classes is None:
-        pipeline._ensure_sampler()
-        classes = pipeline.sampler.get_label_names()
-        print(f"Analyzing all {len(classes)} ImageNet classes\n")
-    else:
-        print(f"Analyzing {len(classes)} classes: {', '.join(classes)}\n")
+    # Determine which classes to analyze
+    classes = resolve_classes(args, pipeline, cfg)
+
+    class_list = " | ".join(classes[:10])
+    print(f"Analyzing {len(classes)} classes: {class_list}"
+          f"{'...' if len(classes) > 10 else ''}\n")
 
     # Run analysis with error handling to ensure reports are always generated
     results = []
     analysis_error = None
+    from datetime import datetime, timezone
+    start_time = datetime.now(timezone.utc)
     try:
         results = pipeline.run(classes)
     except Exception as e:
@@ -293,14 +338,21 @@ def main():
         print("Generating reports with available results...\n")
 
     # Always generate reports (even if empty or partial)
+    end_time = datetime.now(timezone.utc)
+    duration = end_time - start_time
     config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else cfg.dict()
+    config_dict["timing"] = {
+        "start": start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "end": end_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "duration_seconds": int(duration.total_seconds()),
+    }
     reporter = Reporter(cfg.output_dir, config=config_dict)
 
     # Convert results safely
     results_dicts = []
     for r in results:
         try:
-            results_dicts.append(pipeline._result_to_dict(r))
+            results_dicts.append(r.to_dict())
         except Exception as e:
             logger.warning("Failed to convert result for %s: %s", getattr(r, 'class_name', 'unknown'), e)
 
@@ -323,8 +375,6 @@ def main():
 <h1>Analysis Report</h1>
 <p>Analysis completed with {len(results)} classes analyzed.</p>
 <p>Results: {len(results_dicts)} classes processed.</p>
-{f'<p style="color:red;">Error during analysis: {analysis_error}</p>' if analysis_error else ''}
-{f'<p style="color:red;">Error generating full report: {e}</p>' if e else ''}
 </body></html>""")
         paths['json'].write_text('[]')
         paths['markdown'].write_text(f"# Analysis Report\n\nClasses analyzed: {len(results)}\n")

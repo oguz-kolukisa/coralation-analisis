@@ -34,6 +34,9 @@ test = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "gpu: GPU integration tests (require --gpu flag to run)",
+]
 
 [project.scripts]
 coralation = "main:main"

@@ -171,8 +171,8 @@ class TestFindConfusingClasses:
         assert "tiger cat" in result
         assert "Persian cat" in result
 
-    def test_respects_negative_samples_limit(self, pipeline):
-        pipeline.cfg.negative_samples = 1
+    def test_respects_top_negative_classes_limit(self, pipeline):
+        pipeline.cfg.top_negative_classes = 1
 
         mock_clf = MagicMock()
         mock_clf.predict.return_value = MagicMock(

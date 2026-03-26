@@ -45,6 +45,49 @@ tests/unit/test_<module>.py     — tests for src/<module>.py
 tests/unit/test_<module>_<area>.py — tests for a specific area of a module
 ```
 
+### Test quality rules:
+- **Negative test cases required**: Every test class MUST include tests for invalid inputs, empty inputs, and error conditions — not just the happy path
+- **Edge cases required**: Test boundary values (0, empty string, None, single-element lists, very large values)
+- **Mutation safety**: When testing methods that modify data, include a test verifying the original input is NOT mutated (deep copy check)
+- **Type safety**: When working with numpy/scipy, always test that outputs are native Python types (bool, int, float) — not numpy types. Use `json.dumps()` as a serialization smoke test
+- **No error messages in output artifacts**: HTML/Markdown reports must NEVER contain error details, stack traces, or exception messages. Errors go to logs only. Include a test asserting this
+
+## GPU Integration Tests
+
+GPU tests live in `tests/gpu/` and are **skipped by default**. They require the `--gpu` flag.
+
+### Two-tier test architecture:
+```
+tests/unit/    — Fast, no GPU, no model downloads. Run always.
+tests/gpu/     — Requires CUDA + model weights. Run only with --gpu flag.
+```
+
+### Commands:
+```bash
+# Unit tests only (default, fast, always run)
+uv run python -m pytest tests/ -v
+
+# GPU integration tests only
+uv run python -m pytest tests/gpu/ -v --gpu
+
+# Everything (unit + GPU)
+uv run python -m pytest tests/ -v --gpu
+```
+
+### Rules for GPU tests:
+- Mark every GPU test class/module with `pytestmark = pytest.mark.gpu`
+- Use `scope="class"` or `scope="module"` fixtures for expensive model loads
+- Always call `offload()` in fixture teardown to free VRAM
+- Tests that need specific datasets (e.g. ImageNet) must check access and skip gracefully
+- GPU tests NEVER run in CI or default `pytest` — only when a human passes `--gpu`
+- Do NOT add `editor_sam.py` — it was removed from the project
+
+### When to add GPU tests:
+- Any new model wrapper class (classifier, editor, VLM)
+- Changes to attention map generation
+- Changes to model loading/offloading lifecycle
+- Changes to dataset sampling logic
+
 ## Critical: Documentation Sync Requirements
 
 **When modifying the pipeline, you MUST update these files:**
