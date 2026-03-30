@@ -1591,17 +1591,24 @@ You are an expert in computer vision and semantic analysis.
 Target class: **{class_name}**
 
 I have tested these edits on images and measured their impact on classifier confidence.
-For each edit, classify whether the feature being tested is INTRINSIC or CONTEXTUAL.
+For each edit, classify the feature being tested into one of THREE categories.
 
 ## Definitions:
 
-**INTRINSIC features** = Features that are semantically PART OF the object itself.
-- For "{class_name}": parts, inherent textures, colors, shapes that DEFINE what a "{class_name}" is
-- Anything that would still be present if you isolated just the "{class_name}" from its environment
+**INTRINSIC** = The edit REMOVES or ADDS a defining part of the object.
+- Body parts, structures, or features that DEFINE what a "{class_name}" is
+- Examples: removing fins from a fish, adding stripes to a cat, removing wheels from a car
+- If this feature is absent, the object is fundamentally different
 
-**CONTEXTUAL features** = Features that are NOT part of the object itself.
+**CONTEXTUAL** = The edit changes something that is NOT part of the object.
 - Background, environment, setting, lighting, co-occurring objects
-- Anything that describes WHERE or HOW the "{class_name}" is photographed, not WHAT it is
+- Examples: removing ocean background, changing indoor to outdoor, removing a person nearby
+
+**STATE_DEPENDENT** = The edit changes the POSE, STATE, or CONDITION of an intrinsic feature.
+- The feature still exists, but its appearance/position/state is changed
+- Examples: closing an open mouth, changing standing to sitting, folding wings, changing expression
+- A "{class_name}" should be recognizable regardless of its pose or state
+- If the model REQUIRES a specific state (e.g. open mouth) that's a bias
 
 ## Features to classify:
 
@@ -1614,17 +1621,18 @@ For EACH feature above, respond with JSON:
   "classifications": [
     {{
       "index": 1,
-      "feature_name": "simplified name (e.g., 'Main feature', 'Background', 'Color pattern')",
-      "feature_type": "intrinsic" or "contextual",
+      "feature_name": "simplified name",
+      "feature_type": "intrinsic" or "contextual" or "state_dependent",
       "reasoning": "brief explanation"
     }},
     ...
   ]
 }}
 
-Be accurate! The distinction matters:
-- If removing an INTRINSIC feature drops confidence → model correctly uses it (GOOD)
-- If removing a CONTEXTUAL feature drops confidence → model has a shortcut/bias (BAD)
+Key distinction:
+- "Remove the mouth" → INTRINSIC (mouth is part of the animal)
+- "Close the mouth" → STATE_DEPENDENT (mouth still exists, just closed)
+- "Remove the ocean" → CONTEXTUAL (background, not part of the animal)
 """
 
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
@@ -1690,6 +1698,8 @@ Be accurate! The distinction matters:
             return "intrinsic"
         if lower.startswith("context"):
             return "contextual"
+        if lower.startswith("state"):
+            return "state_dependent"
         return raw
 
     def _fill_unclassified(self, features: list[dict]):
@@ -1708,9 +1718,17 @@ Be accurate! The distinction matters:
         "indoor", "outdoor", "habitat", "surrounding", "context",
     ])
 
+    _STATE_KEYWORDS = frozenset([
+        "close", "open", "fold", "unfold", "straighten", "bend",
+        "sit", "stand", "crouch", "curl", "stretch", "tuck",
+        "raise", "lower", "retract", "extend", "relax", "tense",
+    ])
+
     def _fallback_classify(self, instruction: str) -> str:
         """Keyword-based classification when VLM fails."""
         lower = instruction.lower()
         if any(kw in lower for kw in self._CONTEXTUAL_KEYWORDS):
             return "contextual"
+        if any(kw in lower for kw in self._STATE_KEYWORDS):
+            return "state_dependent"
         return "intrinsic"

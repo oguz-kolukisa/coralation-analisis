@@ -213,6 +213,14 @@ class TestFallbackClassify:
         obj = object.__new__(QwenVLAnalyzer)
         assert obj._fallback_classify("") == "intrinsic"
 
+    def test_state_keyword_returns_state_dependent(self):
+        obj = object.__new__(QwenVLAnalyzer)
+        assert obj._fallback_classify("Close the mouth completely") == "state_dependent"
+
+    def test_fold_keyword_returns_state_dependent(self):
+        obj = object.__new__(QwenVLAnalyzer)
+        assert obj._fallback_classify("Fold the wings") == "state_dependent"
+
 
 # ============================================================================
 # Full inference tests (require GPU + model)

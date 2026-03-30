@@ -183,3 +183,46 @@ class TestComparisonReport:
         e = {"feature_type": "", "target_type": "positive",
              "edit_type": "modification", "mean_delta": -0.10}
         assert Reporter._is_spurious(e) is False
+
+    def test_is_spurious_state_dependent(self):
+        """State-dependent features with negative delta are spurious."""
+        e = {"feature_type": "state_dependent", "target_type": "positive",
+             "mean_delta": -0.20}
+        assert Reporter._is_spurious(e) is True
+
+    def test_not_spurious_state_dependent_small_delta(self):
+        e = {"feature_type": "state_dependent", "target_type": "positive",
+             "mean_delta": -0.03}
+        assert Reporter._is_spurious(e) is False
+
+    def test_is_spurious_contextual_boost_positive(self):
+        """Adding context to positive image that boosts confidence = spurious."""
+        e = {"feature_type": "contextual", "target_type": "positive",
+             "mean_delta": 0.15}
+        assert Reporter._is_spurious(e) is True
+
+    def test_not_spurious_contextual_small_boost(self):
+        """Small contextual boost on positive is not spurious."""
+        e = {"feature_type": "contextual", "target_type": "positive",
+             "mean_delta": 0.05}
+        assert Reporter._is_spurious(e) is False
+
+    def test_not_spurious_body_part_mislabeled_contextual(self):
+        """VLM mislabeled body part removal as contextual — not spurious."""
+        e = {"feature_type": "contextual", "target_type": "positive",
+             "instruction": "Remove the combs and wattles completely",
+             "mean_delta": -0.50}
+        assert Reporter._is_spurious(e) is False
+
+    def test_is_spurious_background_removal(self):
+        """Removing background that drops confidence IS spurious."""
+        e = {"feature_type": "contextual", "target_type": "positive",
+             "instruction": "Remove the boat entirely",
+             "mean_delta": -0.50}
+        assert Reporter._is_spurious(e) is True
+
+    def test_is_spurious_context_removal(self):
+        """Actual context removal that drops confidence IS spurious."""
+        e = {"feature_type": "contextual", "target_type": "positive",
+             "edit_type": "context_removal", "mean_delta": -0.30}
+        assert Reporter._is_spurious(e) is True

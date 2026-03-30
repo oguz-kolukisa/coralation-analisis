@@ -112,6 +112,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .feature-tag { background: #3498db; color: white; padding: 3px 10px; border-radius: 12px; font-size: 0.85em; }
   .feature-tag.essential { background: #27ae60; }
   .feature-tag.spurious { background: #e74c3c; }
+  .feature-tag.state { background: #e67e22; }
   .hypothesis-card { background: #f8f9fa; border-left: 4px solid #3498db; padding: 15px; margin: 15px 0; border-radius: 0 4px 4px 0; }
   .hypothesis-card.confirmed-card { border-left-color: #27ae60; background: #f0fff4; }
   .hypothesis-card.shortcut-card { border-left-color: #e74c3c; background: #fff5f5; }
@@ -230,8 +231,9 @@ document.addEventListener('DOMContentLoaded', function() {
       {% for e in r.edit_results if e.confirmed %}
         {# Use VLM feature_type instead of keyword matching #}
         {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
-        {# Only count as shortcut if contextual AND confidence dropped #}
-        {% if is_contextual and e.mean_delta < -0.05 %}
+        {% set is_state = e.feature_type == 'state_dependent' %}
+        {# Count as shortcut if contextual or state_dependent AND confidence dropped #}
+        {% if (is_contextual or is_state) and e.mean_delta < -0.05 %}
           {% set total_shortcuts.count = total_shortcuts.count + 1 %}
         {% endif %}
       {% endfor %}
@@ -469,15 +471,19 @@ document.addEventListener('DOMContentLoaded', function() {
   {% for e in r.edit_results if e.confirmed and not e.likely_failed %}
     {# Use VLM classification - feature_type is set by VLM #}
     {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
+        {% set is_state = e.feature_type == 'state_dependent' %}
     {% set is_intrinsic = e.feature_type == 'intrinsic' %}
     {% set is_modification = e.edit_type == 'modification' or e.edit_type == 'replacement' %}
     {% set is_removal = e.edit_type == 'feature_removal' %}
-    {% if is_contextual and e.mean_delta < -0.05 %}
+    {% if (is_contextual or is_state) and e.mean_delta < -0.05 %}
       {% set has_shortcuts.found = true %}
-    {% elif is_modification and e.mean_delta > spurious_threshold and not is_contextual %}
+    {% elif is_contextual and e.target_type == 'positive' and e.mean_delta > spurious_threshold %}
+      {# Adding/enhancing context on positive image boosts confidence = spurious #}
+      {% set has_spurious.found = true %}
+    {% elif is_modification and e.mean_delta > spurious_threshold and not is_contextual and not is_state %}
       {# Modification (like color change) that increases confidence = spurious correlation #}
       {% set has_spurious.found = true %}
-    {% elif is_contextual and e.mean_delta > 0.05 %}
+    {% elif is_contextual and e.mean_delta > 0.05 and e.target_type != 'positive' %}
       {% set has_robust.found = true %}
     {% elif is_intrinsic and e.mean_delta < -0.05 %}
       {% set has_essential.found = true %}
@@ -494,11 +500,12 @@ document.addEventListener('DOMContentLoaded', function() {
 
     {% for e in r.edit_results if e.confirmed %}
     {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
-    {% if is_contextual and e.mean_delta < -0.05 %}
+        {% set is_state = e.feature_type == 'state_dependent' %}
+    {% if (is_contextual or is_state) and e.mean_delta < -0.05 %}
     <div class="hypothesis-card shortcut-card">
       {# Verdict strip #}
       <div class="verdict-strip verdict-shortcut">
-        <span class="verdict-badge">Shortcut: model relies on {{ e.feature_name if e.feature_name else 'this feature' }}</span>
+        <span class="verdict-badge">{% if is_state %}State bias{% else %}Shortcut{% endif %}: model relies on {{ e.feature_name if e.feature_name else 'this feature' }}</span>
         <span style="font-size: 0.9em; color: #666;">{{ "%.0f"|format(e.original_confidence * 100) }}% → {{ "%.0f"|format((e.original_confidence + e.mean_delta) * 100) }}%</span>
         <div class="confidence-change-bar">
           <div class="bar-fill" style="width: {{ [e.mean_delta|abs * 200, 100]|min }}%; background: #e74c3c;"></div>
@@ -573,8 +580,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
     {% for e in r.edit_results if e.confirmed and not e.likely_failed %}
     {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
+        {% set is_state = e.feature_type == 'state_dependent' %}
     {% set is_modification = e.edit_type == 'modification' or e.edit_type == 'replacement' %}
-    {% if is_modification and e.mean_delta > spurious_threshold and not is_contextual %}
+    {% if is_modification and e.mean_delta > spurious_threshold and not is_contextual and not is_state %}
     <div class="hypothesis-card" style="border-left-color: #e67e22; background: #fff8f0;">
       <div class="verdict-strip" style="background: #fff8f0; border: 1px solid #e67e22;">
         <span class="verdict-badge" style="background: #e67e22;">Spurious correlation: {{ e.feature_name if e.feature_name else 'this feature' }}</span>
@@ -724,6 +732,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     {% for e in r.edit_results if e.confirmed %}
     {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
+        {% set is_state = e.feature_type == 'state_dependent' %}
     {% if is_contextual and e.mean_delta > 0.05 %}
     <div class="hypothesis-card" style="border-left-color: #3498db; background: #f0f8ff;">
       <div class="verdict-strip verdict-robust">
@@ -947,6 +956,8 @@ document.addEventListener('DOMContentLoaded', function() {
       <td>
         {% if f.feature_type == 'intrinsic' %}
           <span class="feature-tag essential">Intrinsic</span>
+        {% elif f.feature_type == 'state_dependent' %}
+          <span class="feature-tag state">State-dependent</span>
         {% else %}
           <span class="feature-tag spurious">Contextual</span>
         {% endif %}
@@ -1119,20 +1130,23 @@ document.addEventListener('DOMContentLoaded', function() {
   {% for e in r.edit_results %}
   {# Use VLM feature_type instead of keyword matching #}
   {% set all_is_ctx = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
+  {% set all_is_state = e.feature_type == 'state_dependent' %}
   {% set all_is_modification = e.edit_type == 'modification' or e.edit_type == 'replacement' %}
   {% set spurious_thresh = config.spurious_positive_delta if config else 0.10 %}
-  {# TRUE shortcut = contextual AND negative delta #}
-  {% set all_is_shortcut = all_is_ctx and e.mean_delta < -0.05 %}
-  {% set all_is_robust = all_is_ctx and e.mean_delta > 0.05 %}
-  {# Spurious correlation = modification with positive delta on non-contextual feature #}
-  {% set all_is_spurious = all_is_modification and e.mean_delta > spurious_thresh and not all_is_ctx %}
+  {# TRUE shortcut = contextual or state_dependent AND negative delta #}
+  {% set all_is_shortcut = (all_is_ctx or all_is_state) and e.mean_delta < -0.05 %}
+  {# Context boost = contextual feature on positive image increases confidence #}
+  {% set all_is_ctx_boost = all_is_ctx and e.target_type == 'positive' and e.mean_delta > spurious_thresh %}
+  {% set all_is_robust = all_is_ctx and e.mean_delta > 0.05 and e.target_type != 'positive' %}
+  {# Spurious correlation = modification with positive delta on non-contextual feature, OR context boost #}
+  {% set all_is_spurious = all_is_ctx_boost or (all_is_modification and e.mean_delta > spurious_thresh and not all_is_ctx and not all_is_state) %}
   <div class="hypothesis-card {{ 'shortcut-card' if (e.confirmed and all_is_shortcut) else ('confirmed-card' if e.confirmed else '') }}">
     <strong>{{ e.instruction }}</strong>
     {% if e.likely_failed %}
       <span style="background: #95a5a6; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">⚠ EDIT FAILED</span>
     {% elif e.confirmed %}
       {% if all_is_shortcut %}
-        <span style="background: #e74c3c; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">🚨 SHORTCUT</span>
+        <span style="background: #e74c3c; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">🚨 {% if all_is_state %}STATE BIAS{% else %}SHORTCUT{% endif %}</span>
       {% elif all_is_spurious %}
         <span style="background: #e67e22; color: white; padding: 3px 8px; border-radius: 4px; font-size: 0.85em;">⚠ SPURIOUS</span>
       {% elif all_is_robust %}
@@ -1830,15 +1844,41 @@ class Reporter:
         """Check if an edit result is a spurious shortcut."""
         feat_type = e.get("feature_type", "")
         edit_type = e.get("edit_type", "")
+        delta = e.get("mean_delta", 0)
+        target = e.get("target_type", "")
         is_contextual = (
             feat_type == "contextual"
             or (not feat_type and edit_type in (
                 "context_addition", "context_removal", "background_change",
             ))
         )
-        is_ctx_pos = (is_contextual
-                      and e.get("target_type") == "positive"
-                      and e.get("mean_delta", 0) < -0.05)
-        is_neg = (e.get("target_type") == "negative"
-                  and e.get("mean_delta", 0) > 0.05)
-        return is_ctx_pos or is_neg
+        # Override: if VLM said contextual but instruction removes a body part,
+        # it's a VLM error — body parts are intrinsic
+        if is_contextual and Reporter._instruction_removes_body_part(e):
+            is_contextual = False
+        is_state = feat_type == "state_dependent"
+        # Removing context drops confidence = shortcut
+        is_ctx_drop = is_contextual and target == "positive" and delta < -0.05
+        # Adding/enhancing context boosts confidence = spurious
+        is_ctx_boost = is_contextual and target == "positive" and delta > 0.10
+        # State change drops confidence = pose/state bias
+        is_state_drop = is_state and target == "positive" and delta < -0.05
+        # Negative image fooled by adding class features
+        is_neg = target == "negative" and delta > 0.05
+        return is_ctx_drop or is_ctx_boost or is_state_drop or is_neg
+
+    _BODY_PART_KEYWORDS = frozenset([
+        "fin", "fins", "dorsal", "beak", "comb", "wattle", "combs", "wattles",
+        "eye", "eyes", "tail", "wing", "wings", "feather", "feathers",
+        "snout", "teeth", "tooth", "jaw", "mouth", "ear", "ears",
+        "leg", "legs", "claw", "claws", "horn", "horns", "scale", "scales",
+        "paw", "paws", "mane", "whisker", "whiskers", "antenna", "antennae",
+    ])
+
+    @staticmethod
+    def _instruction_removes_body_part(e: dict) -> bool:
+        """Check if an instruction removes an intrinsic body part."""
+        instr = e.get("instruction", "").lower()
+        if "remove" not in instr:
+            return False
+        return any(kw in instr for kw in Reporter._BODY_PART_KEYWORDS)
