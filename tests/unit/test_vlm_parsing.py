@@ -554,7 +554,8 @@ class TestClassifyFeaturesMocked:
 
         features = [{"instruction": "Remove ears", "hypothesis": "h"}]
         result = analyzer.classify_features("cat", features)
-        assert result[0]["feature_type"] == ""
+        # Fallback now uses keyword-based classification
+        assert result[0]["feature_type"] == "intrinsic"
 
     def test_out_of_range_index_ignored(self):
         analyzer = _make_analyzer()
@@ -567,5 +568,5 @@ class TestClassifyFeaturesMocked:
 
         features = [{"instruction": "test", "hypothesis": "h"}]
         result = analyzer.classify_features("cat", features)
-        # Index 99 is out of range, so feature_type should NOT be set
-        assert "feature_type" not in result[0]
+        # Index 99 is out of range; _fill_unclassified applies keyword fallback
+        assert result[0]["feature_type"] == "intrinsic"

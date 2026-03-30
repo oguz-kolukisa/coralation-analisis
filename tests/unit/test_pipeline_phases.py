@@ -144,25 +144,25 @@ class TestMakeClassDir:
 class TestCheckpointPath:
     def test_returns_path(self, pipeline, tmp_path):
         path = pipeline._checkpoint_path("cat")
-        assert str(path).endswith("cat/analysis.json")
+        assert str(path).endswith("checkpoints/resnet50/cat.json")
+
+    def test_custom_model_name(self, pipeline, tmp_path):
+        path = pipeline._checkpoint_path("cat", model_name="vit_l_16")
+        assert str(path).endswith("checkpoints/vit_l_16/cat.json")
 
 
 class TestSaveCheckpoint:
     def test_saves_json(self, pipeline, tmp_path):
         result = ClassAnalysisResult(class_name="cat")
-        class_dir = tmp_path / "cat"
-        class_dir.mkdir()
-        pipeline._save_checkpoint(result, class_dir)
-        assert (class_dir / "analysis.json").exists()
+        pipeline._save_checkpoint(result)
+        path = pipeline._checkpoint_path("cat")
+        assert path.exists()
 
 
 class TestLoadCheckpoint:
     def test_loads_existing(self, pipeline, tmp_path):
         result = ClassAnalysisResult(class_name="cat")
-        class_dir = tmp_path / "cat"
-        class_dir.mkdir()
-        path = class_dir / "analysis.json"
-        path.write_text(json.dumps(result.to_dict(), default=str))
+        pipeline._save_checkpoint(result)
         loaded = pipeline._load_checkpoint("cat")
         assert loaded is not None
         assert loaded.class_name == "cat"
@@ -171,9 +171,8 @@ class TestLoadCheckpoint:
         assert pipeline._load_checkpoint("nonexistent") is None
 
     def test_returns_none_on_corrupt_json(self, pipeline, tmp_path):
-        class_dir = tmp_path / "cat"
-        class_dir.mkdir()
-        (class_dir / "analysis.json").write_text("not json")
+        path = pipeline._checkpoint_path("cat")
+        path.write_text("not json")
         assert pipeline._load_checkpoint("cat") is None
 
 
@@ -266,12 +265,14 @@ class TestValidateDirection:
 
     def test_positive_other_type(self, pipeline):
         instr = make_instruction(target="positive", edit_type="compound")
-        assert pipeline._validate_direction(instr, 0.15) is True
+        assert pipeline._validate_direction(instr, 0.15) is False
         assert pipeline._validate_direction(instr, -0.15) is True
 
     def test_negative_target(self, pipeline):
         instr = make_instruction(target="negative", edit_type="feature_addition")
         assert pipeline._validate_direction(instr, 0.15) is True
+        assert pipeline._validate_direction(instr, 0.05) is True
+        assert pipeline._validate_direction(instr, 0.04) is False
         assert pipeline._validate_direction(instr, -0.15) is False
 
 

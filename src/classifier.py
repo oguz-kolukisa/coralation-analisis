@@ -1,9 +1,11 @@
 """
-ResNet-50 classifier wrapper with attention map generation.
+ImageNet classifier wrapper with attention map generation.
+Supports ResNet-50, DINOv2 (ViT-B/14), and ViT-L/16 (SWAG).
 Supports Grad-CAM, Grad-CAM++, and Score-CAM methods.
 """
 from __future__ import annotations
 import logging
+import math
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -11,21 +13,62 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import models, transforms
-from torchvision.models import ResNet50_Weights
+from torchvision.models import ResNet50_Weights, ViT_L_16_Weights
 
 from .models.attention_maps import get_attention_generator, AttentionMapGenerator
 
 logger = logging.getLogger(__name__)
 
-# ImageNet normalization
+# ---------------------------------------------------------------------------
+# Per-model preprocessing (different input sizes)
+# ---------------------------------------------------------------------------
 _NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                    std=[0.229, 0.224, 0.225])
+
+# Default: 224×224 (ResNet-50, DINOv2, ViT V1 variants)
 _PREPROCESS = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     _NORMALIZE,
 ])
+
+# ViT-L/16 SWAG: 512×512 input with BICUBIC interpolation
+_PREPROCESS_512 = transforms.Compose([
+    transforms.Resize(512, interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.CenterCrop(512),
+    transforms.ToTensor(),
+    _NORMALIZE,
+])
+
+# ---------------------------------------------------------------------------
+# Model registry — maps model names to loader config
+# ---------------------------------------------------------------------------
+_MODEL_REGISTRY: dict[str, dict] = {
+    "resnet50": {
+        "loader": "_load_resnet50",
+        "target_layer": "layer4.2",
+        "arch": "cnn",
+        "preprocess": _PREPROCESS,
+    },
+    "dinov2_vitb14_lc": {
+        "loader": "_load_dinov2_vitb14_lc",
+        "target_layer": "backbone.blocks.11",
+        "arch": "vit",
+        "preprocess": _PREPROCESS,
+    },
+    "vit_l_16": {
+        "loader": "_load_vit_l_16",
+        "target_layer": "encoder.layers.encoder_layer_23",
+        "arch": "vit",
+        "preprocess": _PREPROCESS_512,
+    },
+}
+
+
+def available_classifiers() -> list[str]:
+    """Return names of all supported classifier models."""
+    return list(_MODEL_REGISTRY.keys())
 
 
 class ClassifierResult(NamedTuple):
@@ -38,7 +81,7 @@ class ClassifierResult(NamedTuple):
 
 
 class ImageNetClassifier:
-    """Wraps ResNet-50 with configurable attention map support."""
+    """Wraps an ImageNet classifier with configurable attention map support."""
 
     def __init__(
         self,
@@ -46,7 +89,13 @@ class ImageNetClassifier:
         device: str = "cuda",
         attention_method: str = "gradcam++",
     ):
+        if model_name not in _MODEL_REGISTRY:
+            raise ValueError(
+                f"Unknown classifier '{model_name}'. "
+                f"Available: {available_classifiers()}"
+            )
         self._model_name = model_name
+        self._spec = _MODEL_REGISTRY[model_name]
         self._device_str = device
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.attention_method = attention_method
@@ -55,20 +104,60 @@ class ImageNetClassifier:
         self._load_model()
         self.loaded = True
 
+    # ------------------------------------------------------------------
+    # Model loading (dispatch by registry)
+    # ------------------------------------------------------------------
+
     def _load_model(self):
-        """Create model, labels, and attention generator from scratch."""
+        """Dispatch to the correct loader based on model name."""
+        loader = getattr(self, self._spec["loader"])
+        loader()
+        self._preprocess = self._spec["preprocess"]
+        self._init_labels()
+        self._init_attention_generator()
+
+    def _load_resnet50(self):
+        """Load torchvision ResNet-50 with ImageNet-1k weights."""
         weights = ResNet50_Weights.IMAGENET1K_V1
         self.model = models.resnet50(weights=weights)
         self.model.eval().to(self.device)
+        self._raw_labels: list[str] = weights.meta["categories"]
 
-        self.labels: list[str] = weights.meta["categories"]
+    def _load_dinov2_vitb14_lc(self):
+        """Load DINOv2 ViT-B/14 with linear classifier from torch.hub."""
+        self.model = torch.hub.load(
+            "facebookresearch/dinov2", "dinov2_vitb14_lc",
+            pretrained=True,
+        )
+        self.model.eval().to(self.device)
+        self._raw_labels: list[str] = ResNet50_Weights.IMAGENET1K_V1.meta["categories"]
+
+    def _load_vit_l_16(self):
+        """Load ViT-L/16 with SWAG end-to-end ImageNet-1k weights."""
+        weights = ViT_L_16_Weights.IMAGENET1K_SWAG_E2E_V1
+        self.model = models.vit_l_16(weights=weights)
+        self.model.eval().to(self.device)
+        self._raw_labels: list[str] = weights.meta["categories"]
+
+    def _init_labels(self):
+        """Build label lookup from raw labels."""
+        self.labels: list[str] = self._raw_labels
         self._label_to_idx: dict[str, int] = {
             lbl.lower(): i for i, lbl in enumerate(self.labels)
         }
 
-        # Attention map generator (uses pluggable method)
-        self._attention_generator: Optional[AttentionMapGenerator] = None
-        self._init_attention_generator()
+    def _init_attention_generator(self):
+        """Initialize attention map generator with model-specific config."""
+        self._attention_generator: Optional[AttentionMapGenerator] = \
+            get_attention_generator(
+                self.attention_method,
+                target_layer=self._spec["target_layer"],
+                arch=self._spec["arch"],
+            )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def offload(self):
         """Free VRAM by deleting the model entirely."""
@@ -89,10 +178,6 @@ class ImageNetClassifier:
             self._load_model()
             self.loaded = True
 
-    def _init_attention_generator(self):
-        """Initialize the attention map generator based on configured method."""
-        self._attention_generator = get_attention_generator(self.attention_method)
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -100,7 +185,7 @@ class ImageNetClassifier:
     def predict(self, image: Image.Image, target_class_name: str | None = None,
                 top_k: int = 5, compute_gradcam: bool = True) -> ClassifierResult:
         """Run inference and optionally compute attention map."""
-        tensor = _PREPROCESS(image.convert("RGB")).unsqueeze(0).to(self.device)
+        tensor = self._preprocess(image.convert("RGB")).unsqueeze(0).to(self.device)
 
         # Forward pass (no gradients needed for basic prediction)
         with torch.no_grad():
@@ -148,7 +233,7 @@ class ImageNetClassifier:
 
     def _target_confidence(self, image: Image.Image, class_name: str) -> float:
         """Compute softmax confidence for a specific class."""
-        tensor = _PREPROCESS(image.convert("RGB")).unsqueeze(0).to(self.device)
+        tensor = self._preprocess(image.convert("RGB")).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.model(tensor)
             probs = F.softmax(logits, dim=1)[0]
@@ -157,7 +242,7 @@ class ImageNetClassifier:
 
     def get_class_confidence(self, image: Image.Image, class_name: str) -> float:
         """Return confidence score for a specific class (without Grad-CAM)."""
-        tensor = _PREPROCESS(image.convert("RGB")).unsqueeze(0).to(self.device)
+        tensor = self._preprocess(image.convert("RGB")).unsqueeze(0).to(self.device)
         with torch.no_grad():
             logits = self.model(tensor)
             probs = F.softmax(logits, dim=1)[0]

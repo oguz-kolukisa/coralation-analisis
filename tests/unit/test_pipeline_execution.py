@@ -300,7 +300,7 @@ class TestExpectedDirection:
 
     def test_other_type(self, pipeline):
         instr = make_instruction(target="positive", edit_type="compound")
-        assert pipeline._expected_direction(instr) == "any"
+        assert pipeline._expected_direction(instr) == "negative"
 
 
 # ============================================================================
@@ -591,9 +591,7 @@ class TestAnalyzeResults:
         result.edit_results = [make_edit_result()]
         img = _img()
         pred = FakePred()
-        # positives property = annotated_inspect[:len(edit)]
         images = ImageSet(
-            edit=[(img, "cat")],
             annotated_inspect=[(img, pred, "cat")],
         )
         pipeline._classify_features = MagicMock()
@@ -842,7 +840,6 @@ class TestFinalizeClassBatch:
         img = _img()
         pred = FakePred()
         state.images = ImageSet(
-            edit=[(img, "cat")],
             annotated_inspect=[(img, pred, "cat")],
         )
         pipeline._classify_features_inner = MagicMock()

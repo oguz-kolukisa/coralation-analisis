@@ -106,10 +106,12 @@ Analyze the image and Grad-CAM carefully. List EVERY visual feature that could i
    - Overall outline, proportions
    - Distinctive contours
 
-**E) Context & Background**:
+**E) Context & Background** (PAY SPECIAL ATTENTION to these):
    - Environment (indoor/outdoor, natural/urban)
    - Co-occurring objects
    - Typical settings where this class appears
+   - Look for environmental elements that repeat across training images
+   - These are the most likely sources of dataset bias
 
 **F) Grad-CAM Analysis**:
    - What areas have HIGH attention (red)? Why?
@@ -171,20 +173,28 @@ For EACH feature, create a highly detailed edit instruction optimized for AI ima
    - BAD: "Change the background"
    - GOOD: "Replace the entire background with a plain white studio backdrop, maintain sharp edges around the subject"
 
-2. **DESCRIBE THE EXACT OUTCOME**:
+2. **NEVER REFERENCE THE CLASS NAME IN EDIT INSTRUCTIONS**:
+   - BAD: "Make it look more like a {class_name}"
+   - BAD: "Modify to resemble a {class_name}"
+   - BAD: "Add {class_name} characteristics"
+   - GOOD: "Add bright red breast feathers with white wing bars"
+   - GOOD: "Replace texture with smooth dark gray rubbery skin"
+   - Every edit MUST name a concrete visual property (color, shape, texture, pattern, size)
+
+3. **DESCRIBE THE EXACT OUTCOME**:
    - Specify colors: "bright red", "pure white", "dark gray"
    - Specify textures: "smooth matte surface", "natural texture"
    - Specify what to preserve: "maintain the original pose", "keep the lighting consistent"
 
-3. **USE NATURAL LANGUAGE DESCRIPTIONS**:
+4. **USE NATURAL LANGUAGE DESCRIPTIONS**:
    - Describe the specific change with concrete details
    - Include colors, textures, and what should remain unchanged
 
-4. **FOR REMOVALS - Describe what replaces it**:
+5. **FOR REMOVALS - Describe what replaces it**:
    - BAD: "Remove the feature"
    - GOOD: "Remove [feature] completely, blend the area smoothly with the surrounding surface"
 
-5. **FOR BACKGROUND CHANGES - Be vivid**:
+6. **FOR BACKGROUND CHANGES - Be vivid**:
    - "Replace background with a plain neutral gray backdrop"
    - "Change to a professional studio setting with soft diffused lighting"
 
@@ -192,6 +202,13 @@ For EACH feature, create a highly detailed edit instruction optimized for AI ima
 - **removal**: Remove and blend/replace with surrounding texture
 - **modification**: Change appearance significantly (color, texture, size)
 - **replacement**: Replace with something completely different
+
+### IMPORTANT: For contextual features (background, environment, co-occurring objects):
+- Generate REMOVAL edits that NEUTRALIZE the environment
+- "Replace the underwater background with a plain white studio backdrop"
+- "Remove the fishing net entirely, fill with clean neutral gray background"
+- "Remove all co-occurring objects, leaving only the main subject on neutral background"
+- These test whether the model relies on environment rather than the object itself
 
 Respond with JSON:
 {{
@@ -290,6 +307,11 @@ Target class: **{class_name}**
 Based on your world knowledge (NOT by looking at any specific image), list visual features that
 are commonly ASSOCIATED with "{class_name}" but are NOT actually part of what defines it.
 
+CRITICAL: When describing features or edit instructions, NEVER reference "{class_name}" by name.
+Describe only concrete visual properties (colors, textures, shapes, patterns, sizes).
+- BAD: "features that look like {class_name}"
+- GOOD: "bright orange coloring with black vertical stripes"
+
 These are features that an image classifier might incorrectly learn to rely on (shortcuts/biases):
 
 ### Categories to Consider:
@@ -342,7 +364,7 @@ Respond with JSON:
   ],
   "potential_edit_instructions": [
     {{
-      "edit": "detailed edit instruction to add this feature to a non-{class_name} image",
+      "edit": "detailed edit instruction naming specific colors/textures/shapes (NEVER mention {class_name} by name)",
       "feature": "which feature this tests",
       "hypothesis": "if adding this increases {class_name} confidence, the model has this shortcut"
     }}
@@ -403,6 +425,12 @@ I will show you:
 Create diverse edits to test model robustness. Each edit instruction must be HIGHLY DETAILED (50-200 characters).
 
 **CRITICAL RULES FOR EFFECTIVE AI IMAGE EDITING:**
+
+0. **NEVER REFERENCE THE CLASS NAME IN EDIT INSTRUCTIONS**:
+   - BAD: "Make it look more like a {class_name}"
+   - BAD: "Add {class_name} features"
+   - GOOD: "Add bright red breast feathers along the chest area"
+   - Each edit must describe concrete visual changes only
 
 1. **BE EXTREMELY SPECIFIC AND DETAILED**:
    - BAD: "Remove the feature"
@@ -473,6 +501,9 @@ Generate {max_hypotheses} NEW edit instructions that:
 
 ### CRITICAL: Be SPECIFIC and DECISIVE
 - NEVER use "or", "such as", "for example", "like" in edit instructions
+- NEVER reference the target class name in edit instructions
+- BAD: "Add {class_name} features" or "make it resemble a {class_name}"
+- GOOD: "Add elongated curved beak with dark brown coloring"
 - Each edit must be ONE concrete, specific action
 - BAD: "Change background to a nature scene like forest or beach"
 - GOOD: "Replace the background with a solid blue color"
@@ -508,45 +539,66 @@ Target class: **{class_name}**
 This image is NOT a "{class_name}" — it is a "{true_label}".
 Current confidence for "{class_name}": {confidence:.1%}
 
-## Goal: Find what SPURIOUS FEATURES trigger false positives
+## Goal: Find SHORTCUTS that trick the model into misclassifying this as "{class_name}"
 
-Generate DETAILED edits that ADD features commonly associated with "{class_name}" to test if the model
-relies on shortcuts rather than true class-defining features.
+Test whether the model relies on SUPERFICIAL VISUAL CORRELATES (colors, textures, patterns)
+or ENVIRONMENTAL CONTEXT instead of the actual defining features of "{class_name}".
+
+### What is FORBIDDEN vs ALLOWED
+
+**FORBIDDEN — Morphological/structural features (do NOT generate these):**
+- Body parts and anatomy (fins, beaks, feathers, teeth, eyes, limbs, wings, tails)
+- Body shape or silhouette changes
+- Structural features that physically define "{class_name}"
+
+**ALLOWED — Superficial visual correlates (colors, textures, patterns):**
+- Colors that correlate with "{class_name}" but do not define it
+- Textures and surface qualities associated with "{class_name}"
+- Patterns commonly seen on "{class_name}" in training images
+- These are properties that MANY different objects could have
+
+**ALLOWED — Environmental/contextual elements:**
+- Backgrounds and habitats where "{class_name}" is typically photographed
+- Objects commonly found alongside "{class_name}" in training images
+- Lighting and weather conditions typical of "{class_name}" photos
+- Surfaces and materials common in "{class_name}" dataset images
 
 ### CRITICAL: Write HIGHLY DETAILED edit instructions (50-200 characters)
 
-**GOOD EXAMPLES:**
-- "Add [specific feature] with [specific color/texture] in [specific location]"
-- "Overlay a [specific pattern] across the surface with [specific details]"
-- "Place a [specific object] in the [location], with [detailed description]"
-
-**BAD EXAMPLES:**
-- "Add features" (too vague)
-- "Add {class_name} characteristics" (not specific)
+- NEVER reference the class name "{class_name}" in edit instructions
+- Every instruction MUST name concrete visual properties only
 
 ### Types of Additions to Test:
 
-A) **Single Feature Injection** (with detailed description):
-   - Add a single characteristic feature of "{class_name}" with specific details
+A) **Color Correlates**: Colors associated with "{class_name}" in training data
+   - Example for tench: "Change the subject's body color to olive green with golden undertones"
+   - Example for robin: "Paint the chest area bright orange-red with sharp color boundary"
 
-B) **Multiple Feature Injection** (detailed combined changes):
-   - Add multiple features that together suggest "{class_name}"
+B) **Texture/Surface Correlates**: Surface properties associated with "{class_name}"
+   - Example for shark: "Change skin texture to smooth dark gray rubbery surface"
+   - Example for poodle: "Add fluffy white curly texture across the entire body surface"
 
-C) **Context/Background Injection** (vivid scene details):
-   - Add environmental elements typically associated with "{class_name}"
+C) **Pattern Correlates**: Visual patterns associated with "{class_name}"
+   - Example for zebra: "Add bold black and white vertical stripes across the body"
+   - Example for leopard: "Overlay dark rosette spots with tan centers across the surface"
 
-D) **Texture Overlay** (specific texture descriptions):
-   - Apply textures or patterns characteristic of "{class_name}"
+D) **Habitat/Setting**: Typical backgrounds where "{class_name}" appears
+   - Example for fish: "Replace background with murky green pond water with lily pads"
+   - Example for bird: "Add wooden bird feeder with scattered seeds in foreground"
+
+E) **Co-occurring Objects**: Things found alongside "{class_name}" in photos
+   - Example for rooster: "Add wooden fence posts and scattered hay on the ground"
+   - Example for shark: "Add a diving cage with metal bars in the foreground"
 
 For each edit provide:
 - "edit": DETAILED instruction (50-200 chars) with specific colors, textures, positions
-- "hypothesis": Why this might fool the model
-- "type": "feature_addition" | "context_addition" | "texture_addition" | "compound_addition"
+- "hypothesis": Why this might fool the model into classifying as "{class_name}"
+- "type": "correlate_addition" | "context_addition" | "environment_addition" | "co_object_addition"
 - "priority": 1-5 (5 = most likely to trigger false positive)
 
 Respond with JSON:
 {{
-  "common_mistake_triggers": ["features that commonly cause false positives for {class_name}"],
+  "common_mistake_triggers": ["visual shortcuts the model may use for {class_name}"],
   "edit_instructions": [
     {{
       "edit": "...",
@@ -557,10 +609,65 @@ Respond with JSON:
   ]
 }}
 
-Generate {max_hypotheses} diverse edits. Focus on features most likely to trigger misclassification.
+Generate {max_hypotheses} diverse edits. Include AT LEAST HALF as correlate_addition (color, texture, pattern).
 
 CRITICAL: Be SPECIFIC. Never use "or", "such as", "for example". Each instruction = ONE concrete action.
+Do NOT add structural body parts of "{class_name}" — test only superficial properties and context.
 """
+
+
+_ENVIRONMENTAL_ANALYSIS_PROMPT = """\
+You are an expert in dataset bias analysis and image classification.
+
+Target class: **{class_name}**
+
+I am showing you {num_images} sample images, all classified as "{class_name}".
+
+## Your Task: Find RECURRING environmental patterns across these images
+
+Analyze the ENVIRONMENTS and CONTEXTS across all {num_images} images.
+Identify patterns that appear in MULTIPLE images — these indicate dataset bias.
+
+### What to look for:
+- **Backgrounds**: Water color, sky type, indoor/outdoor setting, studio vs natural
+- **Settings**: Specific locations, habitats, terrain types
+- **Lighting**: Time of day, artificial vs natural, flash patterns
+- **Surfaces**: What the subject sits on, ground type, table material
+- **Co-occurring objects**: Items that repeatedly appear alongside the subject
+- **Framing**: Camera angle, distance, composition patterns
+
+### Rules:
+- Only report patterns found in 3 or more images
+- Be SPECIFIC about what you observe (exact colors, materials, conditions)
+- For each pattern, write a REMOVAL edit instruction (50-200 chars)
+- NEVER reference "{class_name}" in edit instructions
+
+Respond with JSON:
+{{
+  "environmental_patterns": [
+    {{
+      "pattern": "specific environmental element observed",
+      "category": "background | setting | lighting | surface | co_object | framing",
+      "frequency": "N out of {num_images}",
+      "removal_edit": "detailed instruction to neutralize this element (50-200 chars)",
+      "hypothesis": "why the model might rely on this environmental cue"
+    }}
+  ]
+}}
+
+List 4-8 patterns, ordered by frequency (most common first).
+"""
+
+
+@dataclass
+class EnvironmentalPattern:
+    """A recurring environmental pattern found across sample images."""
+
+    pattern: str
+    category: str  # background, setting, lighting, surface, co_object, framing
+    frequency: str
+    removal_edit: str
+    hypothesis: str
 
 
 @dataclass
@@ -1156,6 +1263,58 @@ class QwenVLAnalyzer:
         raw = self._run(messages, method_name="analyze_negative")
         return self._parse_analysis(raw, class_name, "negative")
 
+    def analyze_environmental_patterns(
+        self,
+        images: list[Image.Image],
+        class_name: str,
+    ) -> list[EnvironmentalPattern]:
+        """Find recurring environmental patterns across multiple sample images."""
+        prompt = _ENVIRONMENTAL_ANALYSIS_PROMPT.format(
+            class_name=class_name,
+            num_images=len(images),
+        )
+        content = self._build_multi_image_content(images, prompt)
+        messages = [{"role": "user", "content": content}]
+        logger.debug("analyze_environmental_patterns: %s (%d images)", class_name, len(images))
+        raw = self._run(messages, method_name="analyze_environmental_patterns")
+        return self._parse_environmental_patterns(raw)
+
+    def _build_multi_image_content(
+        self,
+        images: list[Image.Image],
+        prompt: str,
+    ) -> list[dict]:
+        """Build VLM content list with multiple images followed by text."""
+        content = [{"type": "image", "image": img} for img in images]
+        content.append({"type": "text", "text": prompt})
+        return content
+
+    def _parse_environmental_patterns(self, raw: str) -> list[EnvironmentalPattern]:
+        """Parse VLM response into EnvironmentalPattern objects."""
+        try:
+            json_match = re.search(r'\{[\s\S]*\}', raw)
+            if not json_match:
+                logger.warning("No JSON found in environmental analysis response")
+                return []
+            data = json.loads(self._repair_json(json_match.group()))
+            return self._convert_pattern_dicts(data.get("environmental_patterns", []))
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning("Failed to parse environmental patterns: %s", e)
+            return []
+
+    def _convert_pattern_dicts(self, patterns: list[dict]) -> list[EnvironmentalPattern]:
+        """Convert raw dicts to EnvironmentalPattern dataclass instances."""
+        result = []
+        for p in patterns:
+            result.append(EnvironmentalPattern(
+                pattern=p.get("pattern", ""),
+                category=p.get("category", ""),
+                frequency=p.get("frequency", ""),
+                removal_edit=p.get("removal_edit", ""),
+                hypothesis=p.get("hypothesis", ""),
+            ))
+        return result
+
     def analyze_iterative(
         self,
         image: Image.Image,
@@ -1471,50 +1630,87 @@ Be accurate! The distinction matters:
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
 
         try:
-            logger.debug("classify_features: Classifying %d features for %s", len(features), class_name)
-            raw = self._run(messages, method_name="classify_features")
-            logger.debug("classify_features: VLM response: %s", raw[:500])
-
-            # Find JSON block - use non-greedy match to get first complete JSON object
-            # Look for {"classifications": ...} pattern specifically
-            json_match = re.search(r'\{\s*"classifications"\s*:\s*\[[\s\S]*?\]\s*\}', raw)
-            if not json_match:
-                # Fallback: try to find any JSON object
-                json_match = re.search(r'\{[\s\S]*?\}', raw)
-
-            if json_match:
-                json_str = json_match.group()
-                json_str = self._repair_json(json_str)
-                result = json.loads(json_str)
-                classifications = result.get("classifications", [])
-
-                # Map classifications back to features
-                for c in classifications:
-                    idx = c.get("index", 0) - 1  # Convert to 0-based
-                    if 0 <= idx < len(features):
-                        features[idx]["feature_type"] = c.get("feature_type", "unknown")
-                        features[idx]["feature_name"] = c.get("feature_name", "")
-                        logger.debug(
-                            "classify_features: Feature %d '%s' -> %s (%s)",
-                            idx + 1,
-                            features[idx].get("instruction", "")[:30],
-                            c.get("feature_type"),
-                            c.get("feature_name")
-                        )
-
+            self._classify_via_vlm(messages, features)
         except Exception as e:
             logger.warning("Failed to classify features: %s", e)
-            # Fall back to keyword-based classification
-            for f in features:
-                f["feature_type"] = self._fallback_classify(f.get("instruction", ""))
-                f["feature_name"] = ""
+            self._classify_via_keywords(features)
 
         return features
 
+    def _classify_via_vlm(self, messages: list, features: list[dict]):
+        """Run VLM classification and map results back to features."""
+        logger.debug("classify_features: Classifying %d features", len(features))
+        raw = self._run(messages, method_name="classify_features")
+        logger.debug("classify_features: VLM response: %s", raw[:500])
+        classifications = self._extract_classifications(raw)
+        self._apply_classifications(classifications, features)
+        self._fill_unclassified(features)
+
+    def _apply_classifications(self, classifications: list[dict], features: list[dict]):
+        """Map VLM classification results back to feature dicts."""
+        for c in classifications:
+            idx = c.get("index", 0) - 1
+            if 0 <= idx < len(features):
+                features[idx]["feature_type"] = self._normalize_feature_type(
+                    c.get("feature_type", "unknown"),
+                )
+                features[idx]["feature_name"] = c.get("feature_name", "")
+
+    def _classify_via_keywords(self, features: list[dict]):
+        """Apply keyword-based fallback to all features."""
+        for f in features:
+            f["feature_type"] = self._fallback_classify(f.get("instruction", ""))
+            f["feature_name"] = ""
+
+    def _extract_classifications(self, raw: str) -> list[dict]:
+        """Parse VLM classification response (object or bare array)."""
+        # Try {"classifications": [...]} first
+        match = re.search(r'\{\s*"classifications"\s*:\s*\[[\s\S]*?\]\s*\}', raw)
+        if match:
+            parsed = json.loads(self._repair_json(match.group()))
+            return parsed.get("classifications", [])
+        # Try bare JSON array: [{"index": 1, ...}, ...]
+        arr_match = re.search(r'\[[\s\S]*\]', raw)
+        if arr_match:
+            parsed = json.loads(self._repair_json(arr_match.group()))
+            if isinstance(parsed, list) and parsed and "index" in parsed[0]:
+                return parsed
+        # Last resort: any JSON object
+        obj_match = re.search(r'\{[\s\S]*?\}', raw)
+        if obj_match:
+            parsed = json.loads(self._repair_json(obj_match.group()))
+            return parsed.get("classifications", [])
+        return []
+
+    @staticmethod
+    def _normalize_feature_type(raw: str) -> str:
+        """Fix common VLM typos in feature_type values."""
+        lower = raw.strip().lower()
+        if lower.startswith("intrins"):
+            return "intrinsic"
+        if lower.startswith("context"):
+            return "contextual"
+        return raw
+
+    def _fill_unclassified(self, features: list[dict]):
+        """Apply keyword fallback to features the VLM did not classify."""
+        for f in features:
+            if not f.get("feature_type"):
+                f["feature_type"] = self._fallback_classify(
+                    f.get("instruction", ""),
+                )
+
+    _CONTEXTUAL_KEYWORDS = frozenset([
+        "background", "environment", "lighting", "scene", "setting",
+        "sky", "ground", "floor", "wall", "water", "grass", "snow",
+        "forest", "field", "sand", "ocean", "sea", "landscape",
+        "weather", "shadow", "reflection", "blur", "bokeh",
+        "indoor", "outdoor", "habitat", "surrounding", "context",
+    ])
+
     def _fallback_classify(self, instruction: str) -> str:
-        """
-        Fallback classification if VLM fails.
-        Returns empty string to indicate unknown - let the report show raw instruction.
-        We avoid keyword-based guessing to stay domain-agnostic.
-        """
-        return ""
+        """Keyword-based classification when VLM fails."""
+        lower = instruction.lower()
+        if any(kw in lower for kw in self._CONTEXTUAL_KEYWORDS):
+            return "contextual"
+        return "intrinsic"

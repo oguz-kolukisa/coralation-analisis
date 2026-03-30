@@ -178,12 +178,8 @@ def main():
     # Config overrides
     parser.add_argument("--output-dir", default="output", help="Output directory")
     parser.add_argument(
-        "--samples", type=int, default=100,
-        help="Number of positive samples per class to EDIT (default: 100)"
-    )
-    parser.add_argument(
-        "--inspect-samples", type=int, default=10,
-        help="Number of images to INSPECT for feature discovery (default: 10, separate from editing)"
+        "--samples", type=int, default=10,
+        help="Number of positive samples per class (used for inspection AND editing, default: 10)"
     )
     parser.add_argument(
         "--top-negative-classes", type=int, default=5,
@@ -203,7 +199,11 @@ def main():
     )
     parser.add_argument(
         "--classifier", default="resnet50",
-        help="Classifier model name (default: resnet50)"
+        help="Single classifier model (default: resnet50). Ignored if --classifiers is set."
+    )
+    parser.add_argument(
+        "--classifiers", nargs="+", default=["resnet50", "dinov2_vitb14_lc", "vit_l_16"],
+        help="Classifier models to compare (default: all three: resnet50 dinov2_vitb14_lc vit_l_16)"
     )
     parser.add_argument(
         "--vlm", default="Qwen/Qwen2.5-VL-7B-Instruct",
@@ -276,13 +276,15 @@ def main():
     class_file_overrides = {}
     if args.class_file:
         class_file_overrides["class_file"] = Path(args.class_file)
+    # Resolve classifier models: --classifiers takes precedence over --classifier
+    classifier_models = args.classifiers if args.classifiers else [args.classifier]
     cfg = Config(
-        classifier_model=args.classifier,
+        classifier_model=classifier_models[0],
+        classifier_models=classifier_models,
         vlm_model=args.vlm,
         editor_model=args.editor,
         output_dir=Path(args.output_dir),
         samples_per_class=args.samples,
-        inspect_samples=args.inspect_samples,
         top_negative_classes=args.top_negative_classes,
         negative_samples_per_class=args.negative_samples,
         confidence_delta_threshold=args.delta_threshold,
@@ -304,9 +306,9 @@ def main():
     print("  CORALATION - Model Bias/Shortcut Discovery")
     print("=" * 60)
     print(f"  Output:     {cfg.output_dir}")
-    print(f"  Inspect:    {cfg.inspect_samples} images for feature discovery")
-    print(f"  Edit:       {cfg.samples_per_class} positive, {cfg.negative_samples_per_class}x{cfg.top_negative_classes} negative samples")
+    print(f"  Samples:    {cfg.samples_per_class} positive, {cfg.negative_samples_per_class}x{cfg.top_negative_classes} negative")
     print(f"  Iterations: {cfg.iterations} per class")
+    print(f"  Classifiers: {', '.join(cfg.classifier_models)}")
     print(f"  Threshold:  {cfg.confidence_delta_threshold}")
     print(f"  Generations: {cfg.generations_per_edit} per edit")
     print(f"  Attention:  {cfg.attention_method}")
@@ -325,10 +327,21 @@ def main():
           f"{'...' if len(classes) > 10 else ''}\n")
 
     # Run analysis with error handling to ensure reports are always generated
-    results = []
-    analysis_error = None
     from datetime import datetime, timezone
     start_time = datetime.now(timezone.utc)
+    analysis_error = None
+
+    if cfg.is_multi_model:
+        multi_results = _run_multi_model(pipeline, classes, cfg, start_time)
+    else:
+        _run_single_model(pipeline, classes, cfg, start_time)
+
+
+def _run_single_model(pipeline, classes, cfg, start_time):
+    """Run single-model analysis and generate reports."""
+    from datetime import datetime, timezone
+    results = []
+    analysis_error = None
     try:
         results = pipeline.run(classes)
     except Exception as e:
@@ -337,49 +350,97 @@ def main():
         print(f"\n⚠ Analysis error: {e}")
         print("Generating reports with available results...\n")
 
-    # Always generate reports (even if empty or partial)
     end_time = datetime.now(timezone.utc)
-    duration = end_time - start_time
+    config_dict = _build_config_dict(cfg, start_time, end_time)
+    reporter = Reporter(cfg.reports_dir, config=config_dict)
+
+    results_dicts = _safe_convert_results(results)
+    paths = _generate_reports(reporter, results_dicts, cfg)
+    _print_single_summary(results, paths, analysis_error)
+
+
+def _run_multi_model(pipeline, classes, cfg, start_time):
+    """Run multi-model analysis and generate per-model + comparison reports."""
+    from datetime import datetime, timezone
+    from src.pipeline import MultiModelResult
+    analysis_error = None
+    multi_results = []
+    try:
+        multi_results = pipeline.run_multi_model(classes)
+    except Exception as e:
+        analysis_error = e
+        logger.error("Multi-model pipeline failed: %s", e, exc_info=True)
+        print(f"\n⚠ Analysis error: {e}")
+
+    end_time = datetime.now(timezone.utc)
+    config_dict = _build_config_dict(cfg, start_time, end_time)
+
+    # Generate per-model reports
+    all_model_dicts: dict[str, list[dict]] = {}
+    for model_name in cfg.classifier_models:
+        model_results = [mr.per_model.get(model_name) for mr in multi_results
+                         if model_name in mr.per_model]
+        model_dicts = _safe_convert_results(model_results)
+        all_model_dicts[model_name] = model_dicts
+
+        model_config = dict(config_dict, classifier_model=model_name)
+        reporter = Reporter(cfg.reports_dir, config=model_config, prefix=model_name)
+        _generate_reports(reporter, model_dicts, cfg, cfg.reports_dir)
+        print(f"  {model_name}: report saved to {cfg.reports_dir / f'{model_name}_report.html'}")
+
+    # Generate comparison report
+    comparison_reporter = Reporter(cfg.reports_dir, config=config_dict)
+    comparison_reporter.generate_comparison(all_model_dicts, cfg.classifier_models)
+
+    _print_multi_summary(multi_results, cfg, analysis_error)
+
+
+def _build_config_dict(cfg, start_time, end_time):
+    """Build config dict with timing info for reports."""
     config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else cfg.dict()
+    duration = end_time - start_time
     config_dict["timing"] = {
         "start": start_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "end": end_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "duration_seconds": int(duration.total_seconds()),
     }
-    reporter = Reporter(cfg.output_dir, config=config_dict)
+    return config_dict
 
-    # Convert results safely
-    results_dicts = []
+
+def _safe_convert_results(results):
+    """Convert ClassAnalysisResult list to dicts, skipping failures."""
+    dicts = []
     for r in results:
+        if r is None:
+            continue
         try:
-            results_dicts.append(r.to_dict())
+            dicts.append(r.to_dict())
         except Exception as e:
-            logger.warning("Failed to convert result for %s: %s", getattr(r, 'class_name', 'unknown'), e)
+            logger.warning("Failed to convert result: %s", e)
+    return dicts
 
-    # Generate reports
+
+def _generate_reports(reporter, results_dicts, cfg, output_dir=None):
+    """Generate HTML/MD/JSON reports, returning paths."""
     try:
-        paths = reporter.generate_all(results_dicts)
+        return reporter.generate_all(results_dicts)
     except Exception as e:
         logger.error("Failed to generate reports: %s", e, exc_info=True)
-        # Create minimal report structure
-        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        d = output_dir or cfg.reports_dir
+        d.mkdir(parents=True, exist_ok=True)
         paths = {
-            'html': cfg.output_dir / 'report.html',
-            'markdown': cfg.output_dir / 'report.md',
-            'json': cfg.output_dir / 'analysis_results.json',
+            'html': d / 'report.html',
+            'markdown': d / 'report.md',
+            'json': d / 'analysis_results.json',
         }
-        # Write minimal HTML report
-        paths['html'].write_text(f"""<!DOCTYPE html>
-<html><head><title>Coralation Report</title></head>
-<body>
-<h1>Analysis Report</h1>
-<p>Analysis completed with {len(results)} classes analyzed.</p>
-<p>Results: {len(results_dicts)} classes processed.</p>
-</body></html>""")
+        paths['html'].write_text("<html><body><h1>Report generation failed</h1></body></html>")
         paths['json'].write_text('[]')
-        paths['markdown'].write_text(f"# Analysis Report\n\nClasses analyzed: {len(results)}\n")
+        paths['markdown'].write_text("# Report generation failed\n")
+        return paths
 
-    # Print summary
+
+def _print_single_summary(results, paths, analysis_error):
+    """Print summary for single-model run."""
     total_confirmed = sum(len(r.confirmed_hypotheses) for r in results)
     total_edits = sum(len(r.edit_results) for r in results)
 
@@ -396,6 +457,33 @@ def main():
     print(f"    HTML:     {paths['html']}")
     print(f"    Markdown: {paths['markdown']}")
     print(f"    JSON:     {paths['json']}")
+
+
+def _print_multi_summary(multi_results, cfg, analysis_error):
+    """Print summary for multi-model run."""
+    print("\n" + "=" * 60)
+    print("  MULTI-MODEL ANALYSIS COMPLETE")
+    print("=" * 60)
+    print(f"  Classes analyzed: {len(multi_results)}")
+    print(f"  Models compared:  {', '.join(cfg.classifier_models)}")
+    for model_name in cfg.classifier_models:
+        model_rs = [mr.per_model.get(model_name) for mr in multi_results
+                     if model_name in mr.per_model]
+        confirmed = sum(len(r.confirmed_hypotheses) for r in model_rs if r)
+        spurious = sum(
+            1 for r in model_rs if r
+            for e in r.confirmed_hypotheses
+            if (e.feature_type == 'contextual' and e.target_type == 'positive' and e.mean_delta < -0.05)
+            or (e.target_type == 'negative' and e.mean_delta > 0.05)
+        )
+        print(f"  {model_name:25s}: {confirmed} confirmed, {spurious} spurious")
+    if analysis_error:
+        print(f"  ⚠ Warning: Analysis had errors (see log)")
+    print("-" * 60)
+    print(f"  Reports saved to:")
+    for model_name in cfg.classifier_models:
+        print(f"    {model_name}: {cfg.reports_dir / f'{model_name}_report.html'}")
+    print(f"    Comparison: {cfg.reports_dir / 'comparison_report.html'}")
     print("=" * 60 + "\n")
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -46,12 +47,10 @@ def _get_feature_display_name(edit_result: dict) -> str:
 def _to_relative_path(abs_path: str, base_dir: Path) -> str:
     """Convert an absolute path to a relative path from base_dir."""
     try:
-        # Resolve both paths to ensure consistent comparison
         path = Path(abs_path).resolve()
         base = base_dir.resolve()
-        return str(path.relative_to(base))
+        return str(os.path.relpath(path, base))
     except ValueError:
-        # If path is not relative to base_dir, return as-is
         return abs_path
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
@@ -230,7 +229,7 @@ document.addEventListener('DOMContentLoaded', function() {
     {% for r in results %}
       {% for e in r.edit_results if e.confirmed %}
         {# Use VLM feature_type instead of keyword matching #}
-        {% set is_contextual = e.feature_type == 'contextual' %}
+        {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
         {# Only count as shortcut if contextual AND confidence dropped #}
         {% if is_contextual and e.mean_delta < -0.05 %}
           {% set total_shortcuts.count = total_shortcuts.count + 1 %}
@@ -303,18 +302,24 @@ document.addEventListener('DOMContentLoaded', function() {
     <tr>
       <th>Class</th>
       <th>Total Edits</th>
-      <th>Generations</th>
       <th>Confirmed</th>
+      <th>Spurious</th>
       <th>Rate</th>
       <th>Risk</th>
       <th>Key Features</th>
     </tr>
     {% for r in results %}
+    {% set ns_ov = namespace(spurious_count=0) %}
+    {% for e in r.confirmed_hypotheses %}
+      {% if ((e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change'])) and e.target_type == 'positive' and e.mean_delta < -0.05) or (e.target_type == 'negative' and e.mean_delta > 0.05) %}
+        {% set ns_ov.spurious_count = ns_ov.spurious_count + 1 %}
+      {% endif %}
+    {% endfor %}
     <tr onclick="showTab('tab-classes'); setTimeout(function(){ showClass('{{ r.class_name|replace(' ', '_') }}'); }, 100);" style="cursor: pointer;">
       <td><strong>{{ r.class_name }}</strong></td>
       <td>{{ r.summary.total_edits }}</td>
-      <td>{{ r.summary.total_generations }}</td>
       <td>{{ r.summary.confirmed_count }}</td>
+      <td>{% if ns_ov.spurious_count > 0 %}<span style="color: #e74c3c; font-weight: bold;">{{ ns_ov.spurious_count }}</span>{% else %}0{% endif %}</td>
       <td>{{ "%.0f"|format(r.summary.confirmation_rate * 100) }}%</td>
       <td>
         {% set rate = r.summary.confirmation_rate %}
@@ -358,8 +363,9 @@ document.addEventListener('DOMContentLoaded', function() {
   <table class="feature-summary">
   <tr>
     <th style="width: 15%;">Class</th>
-    <th style="width: 30%;">Intrinsic Features (Expected)</th>
-    <th style="width: 30%;">Contextual Features (Shortcuts)</th>
+    <th style="width: 25%;">Essential Features</th>
+    <th style="width: 25%;">Spurious Shortcuts</th>
+    <th style="width: 10%;">Spurious Count</th>
     <th style="width: 15%;">Impact</th>
     <th style="width: 10%;">Risk</th>
   </tr>
@@ -367,11 +373,11 @@ document.addEventListener('DOMContentLoaded', function() {
   <tr>
     <td><strong>{{ r.class_name }}</strong></td>
     <td>
-      {# Collect intrinsic features with their impact - use VLM feature_type #}
+      {# Collect intrinsic features with negative delta (essential) #}
       {% set ns = namespace(intrinsic=[]) %}
       {% for e in r.edit_results if e.confirmed %}
-        {% set is_intrinsic = e.feature_type == 'intrinsic' %}
-        {% if is_intrinsic %}
+        {% set is_essential = e.target_type == 'positive' and e.mean_delta < -0.05 and e.feature_type != 'contextual' %}
+        {% if is_essential %}
           {% set feat_name = e.feature_name if e.feature_name else e.instruction[:20] %}
           {% if feat_name not in ns.intrinsic %}
             {% set ns.intrinsic = ns.intrinsic + [feat_name] %}
@@ -385,45 +391,31 @@ document.addEventListener('DOMContentLoaded', function() {
       {% endif %}
     </td>
     <td>
-      {# Collect shortcuts AND spurious correlations - use VLM feature_type #}
-      {# Shortcuts: contextual features with NEGATIVE delta (model relied on them) #}
-      {# Spurious correlations: modifications/replacements with POSITIVE delta (model learned wrong association) #}
-      {% set ns = namespace(shortcuts=[], spurious=[], robust=[]) %}
-      {% set spurious_threshold = config.spurious_positive_delta if config else 0.10 %}
+      {# Collect spurious shortcuts: contextual removals + negative context additions #}
+      {% set ns = namespace(shortcuts=[]) %}
       {% for e in r.edit_results if e.confirmed and not e.likely_failed %}
-        {% set is_contextual = e.feature_type == 'contextual' %}
-        {% set is_modification = e.edit_type == 'modification' or e.edit_type == 'replacement' %}
         {% set feat_name = e.feature_name if e.feature_name else e.instruction[:20] %}
-        {% if is_contextual and e.mean_delta < -0.05 %}
-          {# Contextual feature removal decreased confidence = shortcut #}
-          {% if feat_name not in ns.shortcuts %}
-            {% set ns.shortcuts = ns.shortcuts + [feat_name] %}
-          {% endif %}
-        {% elif is_modification and e.mean_delta > spurious_threshold and not is_contextual %}
-          {# Non-contextual modification INCREASED confidence = spurious correlation #}
-          {% if feat_name not in ns.spurious %}
-            {% set ns.spurious = ns.spurious + [feat_name + ' (+' + "%.0f"|format(e.mean_delta * 100) + '%)'] %}
-          {% endif %}
-        {% elif is_contextual and e.mean_delta > 0.05 %}
-          {% if feat_name not in ns.robust %}
-            {% set ns.robust = ns.robust + [feat_name] %}
-          {% endif %}
+        {% set is_spurious = ((e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change'])) and e.target_type == 'positive' and e.mean_delta < -0.05) or (e.target_type == 'negative' and e.mean_delta > 0.05) %}
+        {% if is_spurious and feat_name not in ns.shortcuts %}
+          {% set ns.shortcuts = ns.shortcuts + [feat_name] %}
         {% endif %}
       {% endfor %}
-      {% if ns.shortcuts or ns.spurious %}
-        {% if ns.shortcuts %}
-          <span class="feature-contextual">🚨 {{ ns.shortcuts[:2]|unique|join(", ") }}</span>
-        {% endif %}
-        {% if ns.spurious %}
-          <span style="color: #e67e22; font-weight: bold;">⚠ Spurious: {{ ns.spurious[:2]|unique|join(", ") }}</span>
-        {% endif %}
-      {% elif ns.robust %}
-        <span style="color: #3498db;">✓ Robust: {{ ns.robust[:2]|unique|join(", ") }}</span>
+      {% if ns.shortcuts %}
+        <span class="feature-contextual">{{ ns.shortcuts[:3]|unique|join(", ") }}{% if ns.shortcuts|length > 3 %} +{{ ns.shortcuts|length - 3 }}{% endif %}</span>
       {% elif r.spurious_features %}
         <span class="feature-contextual">{{ r.spurious_features[:3]|join(", ") }}</span>
       {% else %}
-        <em style="color: #27ae60;">✓ None found</em>
+        <em style="color: #27ae60;">None found</em>
       {% endif %}
+    </td>
+    <td>
+      {% set ns = namespace(count=0) %}
+      {% for e in r.confirmed_hypotheses %}
+        {% if ((e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change'])) and e.target_type == 'positive' and e.mean_delta < -0.05) or (e.target_type == 'negative' and e.mean_delta > 0.05) %}
+          {% set ns.count = ns.count + 1 %}
+        {% endif %}
+      {% endfor %}
+      {% if ns.count > 0 %}<span style="color: #e74c3c; font-weight: bold;">{{ ns.count }}</span>{% else %}0{% endif %}
     </td>
     <td>
       {# Show top impact #}
@@ -476,7 +468,7 @@ document.addEventListener('DOMContentLoaded', function() {
   {% set spurious_threshold = config.spurious_positive_delta if config else 0.10 %}
   {% for e in r.edit_results if e.confirmed and not e.likely_failed %}
     {# Use VLM classification - feature_type is set by VLM #}
-    {% set is_contextual = e.feature_type == 'contextual' %}
+    {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
     {% set is_intrinsic = e.feature_type == 'intrinsic' %}
     {% set is_modification = e.edit_type == 'modification' or e.edit_type == 'replacement' %}
     {% set is_removal = e.edit_type == 'feature_removal' %}
@@ -501,7 +493,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <p style="color: #666;">These are features the model should NOT rely on, but removing them dropped confidence.</p>
 
     {% for e in r.edit_results if e.confirmed %}
-    {% set is_contextual = e.feature_type == 'contextual' %}
+    {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
     {% if is_contextual and e.mean_delta < -0.05 %}
     <div class="hypothesis-card shortcut-card">
       {# Verdict strip #}
@@ -580,7 +572,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <p style="color: #666;">Modifying these features <strong>increased</strong> confidence, suggesting the model learned spurious correlations.</p>
 
     {% for e in r.edit_results if e.confirmed and not e.likely_failed %}
-    {% set is_contextual = e.feature_type == 'contextual' %}
+    {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
     {% set is_modification = e.edit_type == 'modification' or e.edit_type == 'replacement' %}
     {% if is_modification and e.mean_delta > spurious_threshold and not is_contextual %}
     <div class="hypothesis-card" style="border-left-color: #e67e22; background: #fff8f0;">
@@ -731,7 +723,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <p style="color: #666;">Removing these contextual features <strong>increased</strong> confidence. The model is NOT relying on them as shortcuts.</p>
 
     {% for e in r.edit_results if e.confirmed %}
-    {% set is_contextual = e.feature_type == 'contextual' %}
+    {% set is_contextual = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
     {% if is_contextual and e.mean_delta > 0.05 %}
     <div class="hypothesis-card" style="border-left-color: #3498db; background: #f0f8ff;">
       <div class="verdict-strip verdict-robust">
@@ -981,24 +973,88 @@ document.addEventListener('DOMContentLoaded', function() {
     </div>
   </div>
 
-  <h3 class="collapsible open" onclick="toggleCollapse('confirmed-{{ loop.index }}', this); loadImages('confirmed-{{ loop.index }}');">
-    Confirmed Shortcuts ({{ r.confirmed_hypotheses|length }})
-  </h3>
-  <div id="confirmed-{{ loop.index }}" class="collapse-content show">
-  {% if r.confirmed_hypotheses %}
+  {# --- Partition confirmed hypotheses into essential vs spurious --- #}
+  {% set ns_cls = namespace(essential=[], spurious=[], spurious_names={}) %}
   {% for e in r.confirmed_hypotheses %}
-  {# Use VLM feature_type instead of keyword matching #}
-  {% set e_is_contextual = e.feature_type == 'contextual' %}
-  {# TRUE shortcut = contextual AND negative delta (model relied on it) #}
-  {% set e_is_shortcut = e_is_contextual and e.mean_delta < -0.05 %}
-  {# ROBUST = contextual AND positive delta (model not relying on it) #}
-  {% set e_is_robust = e_is_contextual and e.mean_delta > 0.05 %}
-  <div class="hypothesis-card {{ 'shortcut-card' if e_is_shortcut else ('confirmed-card') }}">
+    {% set is_spurious = ((e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change'])) and e.target_type == 'positive' and e.mean_delta < -0.05) or (e.target_type == 'negative' and e.mean_delta > 0.05) %}
+    {% if is_spurious %}
+      {% set ns_cls.spurious = ns_cls.spurious + [e] %}
+      {% set feat = e.feature_name if e.feature_name else e.instruction[:25] %}
+      {% if feat in ns_cls.spurious_names %}
+        {% set _ = ns_cls.spurious_names.update({feat: ns_cls.spurious_names[feat] + 1}) %}
+      {% else %}
+        {% set _ = ns_cls.spurious_names.update({feat: 1}) %}
+      {% endif %}
+    {% else %}
+      {% set ns_cls.essential = ns_cls.essential + [e] %}
+    {% endif %}
+  {% endfor %}
+
+  {# ===== ESSENTIAL FEATURES CONFIRMED ===== #}
+  <h3 class="collapsible open" onclick="toggleCollapse('essential-{{ loop.index }}', this); loadImages('essential-{{ loop.index }}');">
+    Essential Features Confirmed ({{ ns_cls.essential|length }})
+  </h3>
+  <div id="essential-{{ loop.index }}" class="collapse-content show">
+  {% if ns_cls.essential %}
+  {% for e in ns_cls.essential %}
+  <div class="hypothesis-card confirmed-card">
     <strong>{{ e.instruction }}</strong>
-    {% if e_is_shortcut %}
-      <span style="background: #e74c3c; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 5px;">🚨 SHORTCUT</span>
-    {% elif e_is_robust %}
-      <span style="background: #27ae60; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 5px;">✓ ROBUST</span>
+    <span style="background: #27ae60; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 5px;">ESSENTIAL</span>
+    {% if e.priority >= 4 %}<span class="priority-high">Priority {{ e.priority }}</span>{% endif %}
+    <br>
+    <em>{{ e.hypothesis }}</em>
+    <div class="stats-row">
+      <span>Mean Δ: <span class="{{ 'delta-pos' if e.mean_delta > 0 else 'delta-neg' }}">{{ "%+.3f"|format(e.mean_delta) }}±{{ "%.3f"|format(e.std_delta|default(0)) }}</span></span>
+      <span>Range: {{ "%+.3f"|format(e.min_delta) }} to {{ "%+.3f"|format(e.max_delta) }}</span>
+      <span>Confirmed: {{ e.confirmation_count }}/{{ e.generations|length }}</span>
+      <span>Original: {{ "%.3f"|format(e.original_confidence) }}</span>
+    </div>
+    {% if e.p_value is defined and e.p_value < 1.0 %}
+    <div class="stats-row">
+      <span>p-value: {{ "%.4f"|format(e.p_value) }}{% if e.p_value < 0.05 %} ✓{% endif %}</span>
+      <span>Cohen's d: {{ "%.2f"|format(e.cohens_d) }} ({{ e.effect_size }})</span>
+      {% if e.statistically_significant %}<span style="background: #27ae60;">Stat. Significant</span>{% endif %}
+      {% if e.practically_significant %}<span style="background: #3498db;">Pract. Significant</span>{% endif %}
+    </div>
+    {% endif %}
+    <h4 class="collapsible" onclick="toggleCollapse('ess-img-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}', this); loadImages('ess-img-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}');">
+      Original vs Generated Images
+    </h4>
+    <div id="ess-img-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}" class="collapse-content">
+      <div class="generation-row">
+        <div class="generation-item">
+          <img data-src="{{ e.original_image_path }}" alt="original">
+          <div><strong>Original</strong></div>
+          <div>{{ "%.3f"|format(e.original_confidence) }}</div>
+        </div>
+        {% for g in e.generations %}
+        <div class="generation-item">
+          <img data-src="{{ g.edited_image_path }}" alt="gen {{ loop.index }}">
+          <div>Gen {{ loop.index }}</div>
+          <div class="delta {{ 'delta-pos' if g.delta > 0 else 'delta-neg' }}">{{ "%+.3f"|format(g.delta) }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  {% else %}
+  <p><em>No essential features confirmed for this class.</em></p>
+  {% endif %}
+  </div>
+
+  {# ===== SPURIOUS SHORTCUTS FOUND ===== #}
+  <h3 class="collapsible open" onclick="toggleCollapse('spurious-{{ loop.index }}', this); loadImages('spurious-{{ loop.index }}');">
+    Spurious Shortcuts Found ({{ ns_cls.spurious|length }})
+  </h3>
+  <div id="spurious-{{ loop.index }}" class="collapse-content show">
+  {% if ns_cls.spurious %}
+  {% for e in ns_cls.spurious %}
+  <div class="hypothesis-card shortcut-card">
+    <strong>{{ e.instruction }}</strong>
+    <span style="background: #e74c3c; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 5px;">SHORTCUT</span>
+    {% if e.target_type == 'negative' and e.source_class %}
+      <span style="background: #3498db; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 5px;">True class: {{ e.source_class }}</span>
     {% endif %}
     {% if e.priority >= 4 %}<span class="priority-high">Priority {{ e.priority }}</span>{% endif %}
     <br>
@@ -1017,10 +1073,10 @@ document.addEventListener('DOMContentLoaded', function() {
       {% if e.practically_significant %}<span style="background: #3498db;">Pract. Significant</span>{% endif %}
     </div>
     {% endif %}
-    <h4 class="collapsible" onclick="toggleCollapse('images-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}', this); loadImages('images-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}');">
+    <h4 class="collapsible" onclick="toggleCollapse('spur-img-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}', this); loadImages('spur-img-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}');">
       Original vs Generated Images
     </h4>
-    <div id="images-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}" class="collapse-content">
+    <div id="spur-img-{{ r.class_name|replace(' ', '_') }}-{{ loop.index0 }}" class="collapse-content">
       <div class="generation-row">
         <div class="generation-item">
           <img data-src="{{ e.original_image_path }}" alt="original">
@@ -1038,8 +1094,21 @@ document.addEventListener('DOMContentLoaded', function() {
     </div>
   </div>
   {% endfor %}
+
+  {# --- Spurious Feature Summary table --- #}
+  {% if ns_cls.spurious_names %}
+  <h4 style="margin-top: 15px;">Spurious Feature Summary</h4>
+  <table>
+    <tr><th>Feature</th><th>Count</th></tr>
+    {% for feat, count in ns_cls.spurious_names.items() %}
+    <tr><td>{{ feat }}</td><td>{{ count }}</td></tr>
+    {% endfor %}
+    <tr style="font-weight: bold; border-top: 2px solid #333;"><td>Total</td><td>{{ ns_cls.spurious|length }}</td></tr>
+  </table>
+  {% endif %}
+
   {% else %}
-  <p><em>No shortcuts confirmed for this class.</em></p>
+  <p><em>No spurious shortcuts found for this class.</em></p>
   {% endif %}
   </div>
 
@@ -1049,7 +1118,7 @@ document.addEventListener('DOMContentLoaded', function() {
   <div id="edits-{{ loop.index }}" class="collapse-content">
   {% for e in r.edit_results %}
   {# Use VLM feature_type instead of keyword matching #}
-  {% set all_is_ctx = e.feature_type == 'contextual' %}
+  {% set all_is_ctx = e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change']) %}
   {% set all_is_modification = e.edit_type == 'modification' or e.edit_type == 'replacement' %}
   {% set spurious_thresh = config.spurious_positive_delta if config else 0.10 %}
   {# TRUE shortcut = contextual AND negative delta #}
@@ -1267,10 +1336,11 @@ _MD_TEMPLATE = """# Classification Model Bias Analysis Report
 
 ## Overall Summary
 
-| Class | Edits | Generations | Confirmed | Rate | Key Features |
+| Class | Edits | Confirmed | Spurious | Rate | Key Features |
 |---|---|---|---|---|---|
 {% for r in results -%}
-| {{ r.class_name }} | {{ r.summary.total_edits }} | {{ r.summary.total_generations }} | {{ r.summary.confirmed_count }} | {{ "%.0f"|format(r.summary.confirmation_rate * 100) }}% | {{ r.key_features[:3]|join(", ") }} |
+{% set ns_sp = namespace(count=0) %}{% for e in r.confirmed_hypotheses %}{% if ((e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change'])) and e.target_type == 'positive' and e.mean_delta < -0.05) or (e.target_type == 'negative' and e.mean_delta > 0.05) %}{% set ns_sp.count = ns_sp.count + 1 %}{% endif %}{% endfor -%}
+| {{ r.class_name }} | {{ r.summary.total_edits }} | {{ r.summary.confirmed_count }} | {{ ns_sp.count }} | {{ "%.0f"|format(r.summary.confirmation_rate * 100) }}% | {{ r.key_features[:3]|join(", ") }} |
 {% endfor %}
 
 {% for r in results %}
@@ -1296,13 +1366,43 @@ _MD_TEMPLATE = """# Classification Model Bias Analysis Report
 **VLM-Confirmed Shortcuts**: {{ r.confirmed_shortcuts|join(", ") }}
 {% endif %}
 
-### Confirmed Shortcuts ({{ r.confirmed_hypotheses|length }})
-
+### Essential Features Confirmed
+{% set ns_md = namespace(essential=[], spurious=[], spurious_names=[]) %}
 {% for e in r.confirmed_hypotheses %}
+{% set is_spurious = ((e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change'])) and e.target_type == 'positive' and e.mean_delta < -0.05) or (e.target_type == 'negative' and e.mean_delta > 0.05) %}
+{% if is_spurious %}{% set ns_md.spurious = ns_md.spurious + [e] %}{% set feat = e.feature_name if e.feature_name else e.instruction[:25] %}{% if feat not in ns_md.spurious_names %}{% set ns_md.spurious_names = ns_md.spurious_names + [feat] %}{% endif %}{% else %}{% set ns_md.essential = ns_md.essential + [e] %}{% endif %}
+{% endfor %}
+
+{% if ns_md.essential %}
+{% for e in ns_md.essential %}
 #### {{ loop.index }}. {{ e.instruction }}
 
 - **Hypothesis**: {{ e.hypothesis }}
-{% if e.source_class %}- **Source class**: {{ e.source_class }}
+- **Mean Δ**: {{ "%+.3f"|format(e.mean_delta) }} (range: {{ "%+.3f"|format(e.min_delta) }} to {{ "%+.3f"|format(e.max_delta) }})
+- **Confirmations**: {{ e.confirmation_count }}/{{ e.generations|length }} generations
+- **Original confidence**: {{ "%.3f"|format(e.original_confidence) }}
+
+| Generation | Δ Confidence | Image |
+|---|---|---|
+| Original | - | ![Original]({{ e.original_image_path }}) |
+{% for g in e.generations -%}
+| Gen {{ loop.index }} | {{ "%+.3f"|format(g.delta) }} | ![Gen {{ loop.index }}]({{ g.edited_image_path }}) |
+{% endfor %}
+
+{% endfor %}
+{% else %}
+*No essential features confirmed.*
+
+{% endif %}
+
+### Spurious Shortcuts Found ({{ ns_md.spurious|length }})
+
+{% if ns_md.spurious %}
+{% for e in ns_md.spurious %}
+#### {{ loop.index }}. {{ e.instruction }}
+
+- **Hypothesis**: {{ e.hypothesis }}
+{% if e.source_class %}- **True class**: {{ e.source_class }}
 {% endif %}- **Mean Δ**: {{ "%+.3f"|format(e.mean_delta) }} (range: {{ "%+.3f"|format(e.min_delta) }} to {{ "%+.3f"|format(e.max_delta) }})
 - **Confirmations**: {{ e.confirmation_count }}/{{ e.generations|length }} generations
 - **Original confidence**: {{ "%.3f"|format(e.original_confidence) }}
@@ -1315,6 +1415,13 @@ _MD_TEMPLATE = """# Classification Model Bias Analysis Report
 {% endfor %}
 
 {% endfor %}
+
+**Spurious Feature List:** {{ ns_md.spurious_names|join(", ") }} ({{ ns_md.spurious|length }} total)
+
+{% else %}
+*No spurious shortcuts found.*
+
+{% endif %}
 
 ### All Edit Results
 
@@ -1331,10 +1438,11 @@ _MD_TEMPLATE = """# Classification Model Bias Analysis Report
 
 Summary of features, shortcuts, and correlations discovered across all classes.
 
-| Class | Essential Features | Spurious Features | Confirmed Biases | Risk |
+| Class | Essential Features | Spurious Features | Spurious Count | Risk |
 |---|---|---|---|---|
 {% for r in results -%}
-| **{{ r.class_name }}** | {{ r.essential_features|join(", ") if r.essential_features else "Not identified" }} | {{ r.spurious_features|join(", ") if r.spurious_features else (r.confirmed_shortcuts|join(", ") if r.confirmed_shortcuts else "None") }} | {{ r.confirmed_hypotheses|length }} confirmed | {% set rate = r.summary.confirmation_rate %}{% if rate > 0.3 %}🔴 HIGH{% elif rate > 0.1 %}🟡 MEDIUM{% else %}🟢 LOW{% endif %} |
+{% set ns_rub = namespace(count=0) %}{% for e in r.confirmed_hypotheses %}{% if ((e.feature_type == 'contextual' or (not e.feature_type and e.edit_type in ['context_addition', 'context_removal', 'background_change'])) and e.target_type == 'positive' and e.mean_delta < -0.05) or (e.target_type == 'negative' and e.mean_delta > 0.05) %}{% set ns_rub.count = ns_rub.count + 1 %}{% endif %}{% endfor -%}
+| **{{ r.class_name }}** | {{ r.essential_features|join(", ") if r.essential_features else "Not identified" }} | {{ r.spurious_features|join(", ") if r.spurious_features else "None" }} | {{ ns_rub.count }} | {% set rate = r.summary.confirmation_rate %}{% if rate > 0.3 %}🔴 HIGH{% elif rate > 0.1 %}🟡 MEDIUM{% else %}🟢 LOW{% endif %} |
 {% endfor %}
 
 ### Risk Level Legend
@@ -1349,6 +1457,162 @@ Summary of features, shortcuts, and correlations discovered across all classes.
 {% for h in r.confirmed_hypotheses[:3] %}
 - {{ h.instruction }} (Δ={{ "%+.3f"|format(h.mean_delta) }})
 {% endfor %}
+{% endfor %}
+"""
+
+
+# =============================================================================
+# CROSS-MODEL COMPARISON TEMPLATES
+# =============================================================================
+
+_COMPARISON_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Cross-Model Comparison Report</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 30px; background: #f5f5f5; }
+.container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }
+h2 { color: #34495e; margin-top: 30px; }
+table { border-collapse: collapse; width: 100%; margin: 15px 0; }
+th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+th { background: #f8f9fa; font-weight: 600; }
+tr:hover { background: #f1f3f5; }
+.risk-high { background: #e74c3c; color: white; padding: 3px 8px; border-radius: 4px; }
+.risk-medium { background: #f39c12; color: white; padding: 3px 8px; border-radius: 4px; }
+.risk-low { background: #27ae60; color: white; padding: 3px 8px; border-radius: 4px; }
+.spurious-count { color: #e74c3c; font-weight: bold; font-size: 1.1em; }
+.model-header { background: #3498db; color: white; }
+.feature-tag { display: inline-block; padding: 2px 6px; margin: 2px; border-radius: 3px; font-size: 0.85em; }
+.feature-spurious { background: #fde8e8; color: #c0392b; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Cross-Model Comparison Report</h1>
+<p><strong>Models:</strong> {{ models|join(", ") }} | <strong>Classes:</strong> {{ comparison.per_class|length }}</p>
+
+<h2>Model Summary</h2>
+<table>
+  <tr>
+    <th>Model</th>
+    <th>Classes</th>
+    <th>Total Edits</th>
+    <th>Confirmed</th>
+    <th>Spurious</th>
+  </tr>
+  {% for model in models %}
+  {% set s = comparison.per_model[model] %}
+  <tr>
+    <td><strong>{{ model }}</strong></td>
+    <td>{{ s.classes }}</td>
+    <td>{{ s.total_edits }}</td>
+    <td>{{ s.total_confirmed }}</td>
+    <td><span class="spurious-count">{{ s.total_spurious }}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Per-Class Comparison</h2>
+<table>
+  <tr>
+    <th rowspan="2">Class</th>
+    {% for model in models %}
+    <th colspan="3" class="model-header" style="text-align: center;">{{ model }}</th>
+    {% endfor %}
+  </tr>
+  <tr>
+    {% for model in models %}
+    <th>Confirmed</th>
+    <th>Spurious</th>
+    <th>Risk</th>
+    {% endfor %}
+  </tr>
+  {% for row in comparison.per_class %}
+  <tr>
+    <td><strong>{{ row.class_name }}</strong></td>
+    {% for model in models %}
+    {% set ms = row.models[model] %}
+    <td>{{ ms.confirmed }}</td>
+    <td>{% if ms.spurious > 0 %}<span class="spurious-count">{{ ms.spurious }}</span>{% else %}0{% endif %}</td>
+    <td>
+      {% if ms.risk == 'HIGH' %}<span class="risk-high">HIGH</span>
+      {% elif ms.risk == 'MEDIUM' %}<span class="risk-medium">MEDIUM</span>
+      {% else %}<span class="risk-low">{{ ms.risk }}</span>{% endif %}
+    </td>
+    {% endfor %}
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Spurious Features by Model</h2>
+{% for model in models %}
+<h3>{{ model }}</h3>
+{% set s = comparison.per_model[model] %}
+{% if s.total_spurious > 0 %}
+<table>
+  <tr><th>Class</th><th>Spurious Features</th><th>Count</th></tr>
+  {% for row in comparison.per_class %}
+  {% set ms = row.models[model] %}
+  {% if ms.spurious > 0 %}
+  <tr>
+    <td>{{ row.class_name }}</td>
+    <td>{% for f in ms.spurious_features %}<span class="feature-tag feature-spurious">{{ f }}</span>{% endfor %}</td>
+    <td><span class="spurious-count">{{ ms.spurious }}</span></td>
+  </tr>
+  {% endif %}
+  {% endfor %}
+</table>
+{% else %}
+<p><em>No spurious features found.</em></p>
+{% endif %}
+{% endfor %}
+
+</div>
+</body>
+</html>
+"""
+
+_COMPARISON_MD_TEMPLATE = """\
+# Cross-Model Comparison Report
+
+**Models:** {{ models|join(", ") }} | **Classes:** {{ comparison.per_class|length }}
+
+## Model Summary
+
+| Model | Classes | Total Edits | Confirmed | Spurious |
+|---|---|---|---|---|
+{% for model in models -%}
+{% set s = comparison.per_model[model] -%}
+| **{{ model }}** | {{ s.classes }} | {{ s.total_edits }} | {{ s.total_confirmed }} | {{ s.total_spurious }} |
+{% endfor %}
+
+## Per-Class Comparison
+
+| Class |{% for model in models %} {{ model }} Confirmed | {{ model }} Spurious | {{ model }} Risk |{% endfor %}
+|---|{% for model in models %}---|---|---|{% endfor %}
+{% for row in comparison.per_class -%}
+| **{{ row.class_name }}** |{% for model in models %}{% set ms = row.models[model] %} {{ ms.confirmed }} | {{ ms.spurious }} | {{ ms.risk }} |{% endfor %}
+{% endfor %}
+
+## Spurious Features by Model
+
+{% for model in models %}
+### {{ model }}
+
+{% set s = comparison.per_model[model] %}
+{% if s.total_spurious > 0 %}
+| Class | Spurious Features | Count |
+|---|---|---|
+{% for row in comparison.per_class %}{% set ms = row.models[model] %}{% if ms.spurious > 0 -%}
+| {{ row.class_name }} | {{ ms.spurious_features|join(", ") }} | {{ ms.spurious }} |
+{% endif %}{% endfor %}
+{% else %}
+*No spurious features found.*
+{% endif %}
+
 {% endfor %}
 """
 
@@ -1368,7 +1632,7 @@ class Reporter:
         paths = reporter.generate_all(results)
     """
 
-    def __init__(self, output_dir: Path, config: dict | None = None):
+    def __init__(self, output_dir: Path, config: dict | None = None, prefix: str = ""):
         """
         Initialize the reporter.
 
@@ -1379,6 +1643,7 @@ class Reporter:
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.config = config or {}
+        self.prefix = f"{prefix}_" if prefix else ""
 
     def _convert_paths_to_relative(self, results: list[dict]) -> list[dict]:
         """Convert all absolute image paths to relative paths."""
@@ -1426,7 +1691,7 @@ class Reporter:
         return results
 
     def save_consolidated_json(self, results: list[dict]) -> Path:
-        path = self.output_dir / "analysis_results.json"
+        path = self.output_dir / f"{self.prefix}analysis_results.json"
         # Keep absolute paths in JSON for programmatic access
         with open(path, "w") as f:
             json.dump(results, f, indent=2, cls=_NumpyEncoder)
@@ -1435,7 +1700,7 @@ class Reporter:
 
     def generate_html(self, results: list[dict]) -> Path:
         """Generate HTML report with tabs and interactive features."""
-        path = self.output_dir / "report.html"
+        path = self.output_dir / f"{self.prefix}report.html"
         # Use relative paths for HTML (so report is portable)
         relative_results = self._convert_paths_to_relative(results)
         html = Template(_HTML_TEMPLATE).render(results=relative_results, config=self.config)
@@ -1444,7 +1709,7 @@ class Reporter:
         return path
 
     def generate_markdown(self, results: list[dict]) -> Path:
-        path = self.output_dir / "report.md"
+        path = self.output_dir / f"{self.prefix}report.md"
         # Use relative paths for Markdown too
         relative_results = self._convert_paths_to_relative(results)
         md = Template(_MD_TEMPLATE).render(results=relative_results, config=self.config)
@@ -1458,3 +1723,122 @@ class Reporter:
             "html": self.generate_html(results),
             "markdown": self.generate_markdown(results),
         }
+
+    # -----------------------------------------------------------------
+    # Cross-model comparison report
+    # -----------------------------------------------------------------
+
+    def generate_comparison(
+        self, all_model_dicts: dict[str, list[dict]], model_names: list[str],
+    ) -> dict[str, Path]:
+        """Generate cross-model comparison report."""
+        html_path = self.output_dir / "comparison_report.html"
+        md_path = self.output_dir / "comparison_report.md"
+        json_path = self.output_dir / "comparison_results.json"
+
+        comparison = self._build_comparison_data(all_model_dicts, model_names)
+        json_path.write_text(json.dumps(comparison, indent=2, default=str))
+
+        html = Template(_COMPARISON_HTML_TEMPLATE).render(
+            models=model_names, comparison=comparison, config=self.config,
+        )
+        html_path.write_text(html, encoding="utf-8")
+
+        md = Template(_COMPARISON_MD_TEMPLATE).render(
+            models=model_names, comparison=comparison, config=self.config,
+        )
+        md_path.write_text(md, encoding="utf-8")
+
+        logger.info("Saved comparison report: %s", html_path)
+        return {"html": html_path, "markdown": md_path, "json": json_path}
+
+    def _build_comparison_data(
+        self, all_model_dicts: dict[str, list[dict]], model_names: list[str],
+    ) -> dict:
+        """Build structured comparison data across models."""
+        # Collect all class names
+        all_classes = []
+        for dicts in all_model_dicts.values():
+            for d in dicts:
+                cn = d.get("class_name", "")
+                if cn and cn not in all_classes:
+                    all_classes.append(cn)
+
+        per_model_summary = {}
+        for model_name in model_names:
+            dicts = all_model_dicts.get(model_name, [])
+            per_model_summary[model_name] = self._model_summary(dicts)
+
+        per_class = []
+        for class_name in all_classes:
+            row = {"class_name": class_name, "models": {}}
+            for model_name in model_names:
+                dicts = all_model_dicts.get(model_name, [])
+                class_dict = next((d for d in dicts if d.get("class_name") == class_name), None)
+                row["models"][model_name] = self._class_model_summary(class_dict)
+            per_class.append(row)
+
+        return {
+            "model_names": model_names,
+            "per_model": per_model_summary,
+            "per_class": per_class,
+        }
+
+    def _model_summary(self, dicts: list[dict]) -> dict:
+        """Compute summary stats for one model across all classes."""
+        total_confirmed = 0
+        total_spurious = 0
+        total_edits = 0
+        for d in dicts:
+            summary = d.get("summary", {})
+            total_edits += summary.get("total_edits", 0)
+            total_confirmed += summary.get("confirmed_count", 0)
+            for e in d.get("confirmed_hypotheses", []):
+                if self._is_spurious(e):
+                    total_spurious += 1
+        return {
+            "classes": len(dicts),
+            "total_edits": total_edits,
+            "total_confirmed": total_confirmed,
+            "total_spurious": total_spurious,
+        }
+
+    def _class_model_summary(self, class_dict: dict | None) -> dict:
+        """Compute per-class stats for one model."""
+        if not class_dict:
+            return {"confirmed": 0, "spurious": 0, "risk": "N/A",
+                    "spurious_features": []}
+        confirmed = class_dict.get("summary", {}).get("confirmed_count", 0)
+        spurious = 0
+        spurious_features = []
+        for e in class_dict.get("confirmed_hypotheses", []):
+            if self._is_spurious(e):
+                spurious += 1
+                feat = e.get("feature_name") or e.get("instruction", "")[:25]
+                if feat not in spurious_features:
+                    spurious_features.append(feat)
+        risk = class_dict.get("summary", {}).get("risk_level", "MEDIUM")
+        return {
+            "confirmed": confirmed,
+            "spurious": spurious,
+            "risk": risk,
+            "spurious_features": spurious_features,
+        }
+
+    @staticmethod
+    def _is_spurious(e: dict) -> bool:
+        """Check if an edit result is a spurious shortcut."""
+        feat_type = e.get("feature_type", "")
+        edit_type = e.get("edit_type", "")
+        is_contextual = (
+            feat_type == "contextual"
+            or (not feat_type and edit_type in (
+                "context_addition", "context_removal", "background_change",
+            ))
+        )
+        is_ctx_pos = (is_contextual
+                      and e.get("target_type") == "positive"
+                      and e.get("mean_delta", 0) < -0.05)
+        is_neg = (e.get("target_type") == "negative"
+                  and e.get("mean_delta", 0) > 0.05)
+        return is_ctx_pos or is_neg

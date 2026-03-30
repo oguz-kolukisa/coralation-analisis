@@ -25,14 +25,14 @@ class TestConfigDefaults:
 
     def test_default_samples(self):
         cfg = Config()
-        assert cfg.samples_per_class == 100
+        assert cfg.samples_per_class == 10
         assert cfg.top_negative_classes == 5
         assert cfg.negative_samples_per_class == 5
-        assert cfg.inspect_samples == 10
 
     def test_default_thresholds(self):
         cfg = Config()
         assert cfg.confidence_delta_threshold == 0.15
+        assert cfg.negative_delta_threshold == 0.05
         assert cfg.statistical_alpha == 0.05
         assert cfg.min_effect_size == 0.5
         assert cfg.dedup_similarity_threshold == 0.70

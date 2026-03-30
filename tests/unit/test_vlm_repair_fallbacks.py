@@ -67,13 +67,14 @@ class TestGenerateKnowledgeRepairFallback:
 
 class TestClassifyFeaturesJsonFallback:
     def test_fallback_json_search(self):
-        """When the classifications-specific regex fails, falls back to any JSON."""
+        """When wrapped in non-standard key, bare array extraction still works."""
         a = _make_analyzer()
-        # Return JSON that doesn't match the classifications-specific pattern
+        # Array inside "results" key (not "classifications") - bare array extraction finds it
         a._run = lambda *args, **kwargs: 'Here is result: {"results": [{"index": 1, "feature_name": "bg", "feature_type": "contextual"}]}'
         a._repair_json = QwenVLAnalyzer._repair_json.__get__(a)
 
         features = [{"instruction": "Remove bg", "hypothesis": "h"}]
         result = a.classify_features("cat", features)
-        # Won't match index pattern since key is "results" not "classifications"
-        assert "feature_type" not in result[0]
+        # Bare array extraction finds the array with "index" key and maps it
+        assert result[0]["feature_type"] == "contextual"
+        assert result[0]["feature_name"] == "bg"

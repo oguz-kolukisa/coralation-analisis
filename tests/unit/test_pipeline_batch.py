@@ -42,7 +42,6 @@ def sample_state():
 def sample_state_with_images(sample_state):
     images = ImageSet()
     images.inspect = [(make_image(), "tabby cat")]
-    images.edit = [(make_image(), "tabby cat")]
     images.annotated_inspect = [(make_image(), MagicMock(), "tabby cat")]
     sample_state.images = images
     return sample_state
@@ -266,11 +265,11 @@ class TestGenerateEditInstructionsInner:
         ]
         images = ImageSet()
         images.annotated_inspect = [(make_image(), MagicMock(), "cat")]
-        images.edit = [(make_image(), "cat")]
         images.annotated_negatives = []
         with patch.object(pipeline, "_generate_positive_edits", return_value=[]):
             with patch.object(pipeline, "_generate_negative_edits", return_value=[]):
-                inputs = pipeline._generate_edit_instructions_inner("cat", images, result)
+                with patch.object(pipeline, "_generate_environmental_edits", return_value=[]):
+                    inputs = pipeline._generate_edit_instructions_inner("cat", images, result)
         assert inputs == []
 
 

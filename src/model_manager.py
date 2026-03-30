@@ -3,6 +3,7 @@ Model lifecycle manager for the analysis pipeline.
 
 Single responsibility: load/offload models for VRAM efficiency.
 Uses a singleton-like pattern: requesting any model auto-offloads all others.
+Supports multiple classifiers for multi-model analysis.
 """
 from __future__ import annotations
 
@@ -25,7 +26,8 @@ class ModelManager:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._classifier: ImageNetClassifier | None = None
+        self._classifiers: dict[str, ImageNetClassifier] = {}
+        self._active_classifier: str | None = None
         self._vlm: QwenVLAnalyzer | None = None
         self._editor: ImageEditor | None = None
         self._sampler: ImageNetSampler | None = None
@@ -34,8 +36,8 @@ class ModelManager:
         """Delete all models except the requested one to free memory."""
         if not self.cfg.low_vram:
             return
+        self._offload_other_classifiers(model_name)
         wrappers = [
-            ("classifier", self._classifier),
             ("vlm", self._vlm),
             ("editor", self._editor),
         ]
@@ -44,18 +46,26 @@ class ModelManager:
                 wrapper.offload()
         torch.cuda.empty_cache()
 
-    def classifier(self) -> ImageNetClassifier:
-        """Get classifier, loading if needed. Auto-offloads others in low_vram."""
-        self._ensure_only("classifier")
-        if self._classifier is None:
-            self._classifier = ImageNetClassifier(
-                model_name=self.cfg.classifier_model,
+    def _offload_other_classifiers(self, keep: str):
+        """Offload all classifiers except the one named `keep`."""
+        for name, clf in self._classifiers.items():
+            if name != keep and clf.loaded:
+                clf.offload()
+
+    def classifier(self, model_name: str | None = None) -> ImageNetClassifier:
+        """Get classifier by name. Auto-offloads others in low_vram mode."""
+        name = model_name or self.cfg.classifier_model
+        self._ensure_only(f"classifier:{name}")
+        if name not in self._classifiers:
+            self._classifiers[name] = ImageNetClassifier(
+                model_name=name,
                 device=self.cfg.device,
                 attention_method=self.cfg.attention_method,
             )
-        elif not self._classifier.loaded:
-            self._classifier.load_to_gpu()
-        return self._classifier
+        elif not self._classifiers[name].loaded:
+            self._classifiers[name].load_to_gpu()
+        self._active_classifier = name
+        return self._classifiers[name]
 
     def vlm(self) -> QwenVLAnalyzer:
         """Get VLM, loading if needed. Auto-offloads others in low_vram."""
@@ -96,10 +106,16 @@ class ModelManager:
             )
         return self._sampler
 
-    def offload_classifier(self):
-        """Fully delete classifier to free VRAM."""
-        if self._classifier and self._classifier.loaded:
-            self._classifier.offload()
+    def offload_classifier(self, model_name: str | None = None):
+        """Offload a specific classifier or all classifiers."""
+        if model_name:
+            clf = self._classifiers.get(model_name)
+            if clf and clf.loaded:
+                clf.offload()
+        else:
+            for clf in self._classifiers.values():
+                if clf.loaded:
+                    clf.offload()
 
     def offload_vlm(self):
         """Fully delete VLM to free VRAM."""

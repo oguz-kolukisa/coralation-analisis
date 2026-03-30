@@ -25,9 +25,9 @@ def config_high_vram():
 # =========================================================================
 
 class TestInit:
-    def test_all_models_start_none(self, config):
+    def test_all_models_start_empty(self, config):
         mm = ModelManager(config)
-        assert mm._classifier is None
+        assert mm._classifiers == {}
         assert mm._vlm is None
         assert mm._editor is None
         assert mm._sampler is None
@@ -48,7 +48,7 @@ class TestLazyLoading:
         mm = ModelManager(config_high_vram)
         result = mm.classifier()
         MockClassifier.assert_called_once()
-        assert result is mm._classifier
+        assert result is mm._classifiers["resnet50"]
 
     @patch("src.model_manager.ImageNetClassifier")
     @patch("src.model_manager.torch")
@@ -58,6 +58,16 @@ class TestLazyLoading:
         second = mm.classifier()
         assert MockClassifier.call_count == 1
         assert first is second
+
+    @patch("src.model_manager.ImageNetClassifier")
+    @patch("src.model_manager.torch")
+    def test_classifier_by_name(self, mock_torch, MockClassifier, config_high_vram):
+        mm = ModelManager(config_high_vram)
+        result = mm.classifier("resnet50")
+        MockClassifier.assert_called_once_with(
+            model_name="resnet50", device="cpu", attention_method="scorecam",
+        )
+        assert result is mm._classifiers["resnet50"]
 
     @patch("src.model_manager.QwenVLAnalyzer")
     @patch("src.model_manager.torch")
@@ -108,12 +118,13 @@ class TestLowVramOffloading:
     @patch("src.model_manager.torch")
     def test_vlm_offloads_classifier_and_editor(self, mock_torch, MockVLM, config):
         mm = ModelManager(config)
-        mm._classifier = MagicMock()
-        mm._classifier.loaded = True
+        mock_clf = MagicMock()
+        mock_clf.loaded = True
+        mm._classifiers["resnet50"] = mock_clf
         mm._editor = MagicMock()
         mm._editor.loaded = True
         mm.vlm()
-        mm._classifier.offload.assert_called_once()
+        mock_clf.offload.assert_called_once()
         mm._editor.offload.assert_called_once()
 
     @patch("src.model_manager.ImageEditor")
@@ -134,10 +145,20 @@ class TestOffloading:
     @patch("src.model_manager.torch")
     def test_offload_classifier_calls_offload(self, mock_torch, config):
         mm = ModelManager(config)
-        mm._classifier = MagicMock()
-        mm._classifier.loaded = True
+        mock_clf = MagicMock()
+        mock_clf.loaded = True
+        mm._classifiers["resnet50"] = mock_clf
         mm.offload_classifier()
-        mm._classifier.offload.assert_called_once()
+        mock_clf.offload.assert_called_once()
+
+    @patch("src.model_manager.torch")
+    def test_offload_classifier_by_name(self, mock_torch, config):
+        mm = ModelManager(config)
+        mock_clf = MagicMock()
+        mock_clf.loaded = True
+        mm._classifiers["resnet50"] = mock_clf
+        mm.offload_classifier("resnet50")
+        mock_clf.offload.assert_called_once()
 
     @patch("src.model_manager.torch")
     def test_offload_classifier_none_is_noop(self, mock_torch, config):
@@ -173,14 +194,15 @@ class TestOffloading:
     @patch("src.model_manager.torch")
     def test_offload_all(self, mock_torch, config):
         mm = ModelManager(config)
-        mm._classifier = MagicMock()
-        mm._classifier.loaded = True
+        mock_clf = MagicMock()
+        mock_clf.loaded = True
+        mm._classifiers["resnet50"] = mock_clf
         mm._vlm = MagicMock()
         mm._vlm.loaded = True
         mm._editor = MagicMock()
         mm._editor.loaded = True
         mm.offload_all()
-        mm._classifier.offload.assert_called_once()
+        mock_clf.offload.assert_called_once()
         mm._vlm.offload.assert_called_once()
         mm._editor.offload.assert_called_once()
         mock_torch.cuda.empty_cache.assert_called()

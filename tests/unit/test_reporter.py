@@ -136,9 +136,9 @@ class TestToRelativePath:
         result = _to_relative_path("/output/class/img.jpg", Path("/output"))
         assert result == "class/img.jpg"
 
-    def test_unrelated_path_returned_as_is(self):
+    def test_sibling_path_uses_dotdot(self):
         result = _to_relative_path("/other/dir/img.jpg", Path("/output"))
-        assert result == "/other/dir/img.jpg"
+        assert result == "../other/dir/img.jpg"
 
     def test_same_directory(self):
         result = _to_relative_path("/output/img.jpg", Path("/output"))
@@ -376,3 +376,189 @@ class TestHtmlTimingDisplay:
         reporter.generate_html([])
         html = (tmp_path / "report.html").read_text()
         assert "Execution Timing" not in html
+
+
+# ============================================================================
+# Prefix support
+# ============================================================================
+
+class TestReporterPrefix:
+    def test_no_prefix_uses_default_names(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        assert reporter.prefix == ""
+        paths = reporter.generate_all([])
+        assert (tmp_path / "report.html").exists()
+        assert (tmp_path / "report.md").exists()
+        assert (tmp_path / "analysis_results.json").exists()
+
+    def test_prefix_prepends_to_filenames(self, tmp_path):
+        reporter = Reporter(tmp_path, prefix="resnet50")
+        assert reporter.prefix == "resnet50_"
+        paths = reporter.generate_all([])
+        assert (tmp_path / "resnet50_report.html").exists()
+        assert (tmp_path / "resnet50_report.md").exists()
+        assert (tmp_path / "resnet50_analysis_results.json").exists()
+
+    def test_two_prefixes_coexist(self, tmp_path):
+        Reporter(tmp_path, prefix="resnet50").generate_all([])
+        Reporter(tmp_path, prefix="vit_l_16").generate_all([])
+        assert (tmp_path / "resnet50_report.html").exists()
+        assert (tmp_path / "vit_l_16_report.html").exists()
+
+
+# ============================================================================
+# HTML report content validation
+# ============================================================================
+
+def _make_sample_result():
+    """Build a minimal but realistic result dict for report rendering."""
+    return {
+        "class_name": "tabby cat",
+        "key_features": ["ear shape", "stripe pattern"],
+        "essential_features": ["fur texture", "ear shape"],
+        "spurious_features": ["indoor background"],
+        "detected_features": [
+            {"name": "ear shape", "category": "shape",
+             "feature_type": "intrinsic", "gradcam_attention": "high"},
+            {"name": "wooden floor", "category": "context",
+             "feature_type": "contextual", "gradcam_attention": "low"},
+        ],
+        "knowledge_based_features": [],
+        "environmental_patterns": [],
+        "gradcam_summary": "Focus on head and torso",
+        "model_focus": "Focus on head and torso",
+        "baseline_results": [],
+        "edit_results": [
+            {
+                "instruction": "Remove the wooden floor",
+                "hypothesis": "Model relies on floor",
+                "edit_type": "context_removal",
+                "target_type": "positive",
+                "priority": 5,
+                "original_confidence": 0.95,
+                "original_image_path": "/fake/img.jpg",
+                "generations": [{
+                    "seed": 0, "edited_confidence": 0.40,
+                    "delta": -0.55, "edited_image_path": "/fake/edited.jpg",
+                    "edit_verified": True, "verification_confidence": 1.0,
+                    "verification_description": "",
+                    "gradcam_image_path": "", "gradcam_diff_path": "",
+                }],
+                "mean_edited_confidence": 0.40,
+                "mean_delta": -0.55, "std_delta": 0.0,
+                "min_delta": -0.55, "max_delta": -0.55,
+                "confirmed": True, "confirmation_count": 1,
+                "p_value": 0.01, "cohens_d": 2.5, "effect_size": "large",
+                "statistically_significant": True,
+                "practically_significant": True,
+                "validation_method": "statistical",
+                "feature_type": "contextual", "feature_name": "wooden floor",
+                "source_class": "", "likely_failed": False, "tautological": False,
+                "original_gradcam_path": "",
+            }
+        ],
+        "confirmed_hypotheses": [
+            {
+                "instruction": "Remove the wooden floor",
+                "hypothesis": "Model relies on floor",
+                "edit_type": "context_removal",
+                "target_type": "positive",
+                "feature_type": "contextual", "feature_name": "wooden floor",
+                "mean_delta": -0.55, "std_delta": 0.0,
+                "min_delta": -0.55, "max_delta": -0.55,
+                "confirmed": True, "confirmation_count": 1,
+                "original_confidence": 0.95,
+                "mean_edited_confidence": 0.40,
+                "original_image_path": "/fake/img.jpg",
+                "original_gradcam_path": "",
+                "generations": [{
+                    "seed": 0, "edited_confidence": 0.40,
+                    "delta": -0.55, "edited_image_path": "/fake/edited.jpg",
+                    "edit_verified": True, "verification_confidence": 1.0,
+                    "verification_description": "",
+                    "gradcam_image_path": "", "gradcam_diff_path": "",
+                }],
+                "p_value": 0.01, "cohens_d": 2.5, "effect_size": "large",
+                "statistically_significant": True,
+                "practically_significant": True,
+                "validation_method": "statistical",
+                "likely_failed": False, "tautological": False,
+                "source_class": "", "priority": 5,
+            },
+        ],
+        "iterations_completed": 1,
+        "vlm_insights": [],
+        "confirmed_shortcuts": ["wooden floor"],
+        "feature_importance": [],
+        "robustness_score": 3,
+        "risk_level": "HIGH",
+        "vulnerabilities": ["Relies on background"],
+        "recommendations": ["Train with diverse backgrounds"],
+        "final_summary": "Model relies on background context.",
+        "summary": {
+            "total_edits": 1, "total_generations": 1,
+            "confirmed_count": 1, "confirmation_rate": 1.0,
+            "iterations": 1, "robustness_score": 3, "risk_level": "HIGH",
+        },
+    }
+
+
+class TestHtmlReportContent:
+    def test_renders_class_name(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        reporter.generate_html([_make_sample_result()])
+        html = (tmp_path / "report.html").read_text()
+        assert "tabby cat" in html
+
+    def test_renders_spurious_shortcut(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        reporter.generate_html([_make_sample_result()])
+        html = (tmp_path / "report.html").read_text()
+        assert "SHORTCUT" in html
+
+    def test_renders_feature_tags(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        reporter.generate_html([_make_sample_result()])
+        html = (tmp_path / "report.html").read_text()
+        assert "indoor background" in html
+
+    def test_renders_risk_level(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        reporter.generate_html([_make_sample_result()])
+        html = (tmp_path / "report.html").read_text()
+        assert "HIGH" in html
+
+    def test_no_error_messages_in_html(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        reporter.generate_html([_make_sample_result()])
+        html = (tmp_path / "report.html").read_text()
+        assert "Traceback" not in html
+        assert "Exception" not in html
+
+    def test_image_paths_are_relative(self, tmp_path):
+        result = _make_sample_result()
+        img_dir = tmp_path / "images" / "tabby_cat"
+        img_dir.mkdir(parents=True)
+        result["edit_results"][0]["original_image_path"] = str(img_dir / "img.jpg")
+        result["edit_results"][0]["generations"][0]["edited_image_path"] = str(img_dir / "edited.jpg")
+        result["confirmed_hypotheses"][0]["original_image_path"] = str(img_dir / "img.jpg")
+        result["confirmed_hypotheses"][0]["generations"][0]["edited_image_path"] = str(img_dir / "edited.jpg")
+        reporter = Reporter(tmp_path)
+        reporter.generate_html([result])
+        html = (tmp_path / "report.html").read_text()
+        assert str(tmp_path) not in html
+        assert "images/tabby_cat/" in html
+
+
+class TestMarkdownReportContent:
+    def test_renders_class_name(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        reporter.generate_markdown([_make_sample_result()])
+        md = (tmp_path / "report.md").read_text()
+        assert "tabby cat" in md
+
+    def test_renders_confirmed_count(self, tmp_path):
+        reporter = Reporter(tmp_path)
+        reporter.generate_markdown([_make_sample_result()])
+        md = (tmp_path / "report.md").read_text()
+        assert "1" in md

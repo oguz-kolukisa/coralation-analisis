@@ -44,7 +44,7 @@ from .config import Config
 from .model_manager import ModelManager
 from .models.attention_maps import compute_attention_diff, render_diff_heatmap
 from .vlm import (
-    DetectedFeature, EditInstruction, FinalAnalysis,
+    DetectedFeature, EditInstruction, EnvironmentalPattern, FinalAnalysis,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,21 @@ def _flush_logs():
     """Flush all log handlers to ensure logs are written immediately."""
     for handler in logging.root.handlers:
         handler.flush()
+
+
+# =============================================================================
+# EDIT QUALITY CHECKS
+# =============================================================================
+
+
+def _is_tautological_edit(instruction: str, class_name: str) -> bool:
+    """Check if an edit instruction circularly references the target class."""
+    instr_lower = instruction.lower()
+    for synonym in class_name.lower().split(","):
+        synonym = synonym.strip()
+        if len(synonym) > 3 and synonym in instr_lower:
+            return True
+    return False
 
 
 # =============================================================================
@@ -110,6 +125,8 @@ class EditResult:
     feature_name: str = ""
     source_class: str = ""
     likely_failed: bool = False
+    tautological: bool = False
+    validation_method: str = ""
 
     @property
     def edited_confidence(self) -> float:
@@ -134,7 +151,6 @@ class EditResult:
 class ImageSet:
     """All sampled images for one class analysis."""
     inspect: list[tuple[Image.Image, str]] = field(default_factory=list)
-    edit: list[tuple[Image.Image, str]] = field(default_factory=list)
     negative: list[tuple[Image.Image, str]] = field(default_factory=list)
     confusing_classes: list[str] = field(default_factory=list)
     annotated_inspect: list = field(default_factory=list)
@@ -142,8 +158,8 @@ class ImageSet:
 
     @property
     def positives(self):
-        """Edit-subset of annotated inspect images."""
-        return self.annotated_inspect[:len(self.edit)]
+        """All annotated positive images (used for both inspection and editing)."""
+        return self.annotated_inspect
 
 
 @dataclass
@@ -215,6 +231,7 @@ class ClassAnalysisResult:
     spurious_features: list[str] = field(default_factory=list)
     detected_features: list[dict] = field(default_factory=list)
     knowledge_based_features: list[dict] = field(default_factory=list)
+    environmental_patterns: list[dict] = field(default_factory=list)
     gradcam_summary: str = ""
     model_focus: str = ""
 
@@ -322,6 +339,30 @@ class ClassAnalysisResult:
 
 
 # =============================================================================
+# MULTI-MODEL RESULT
+# =============================================================================
+
+@dataclass
+class MultiModelResult:
+    """Cross-model analysis results for one class."""
+    class_name: str
+    per_model: dict[str, ClassAnalysisResult] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "class_name": self.class_name,
+            "models": {name: r.to_dict() for name, r in self.per_model.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MultiModelResult:
+        result = cls(class_name=data["class_name"])
+        for name, r_dict in data.get("models", {}).items():
+            result.per_model[name] = ClassAnalysisResult.from_dict(r_dict)
+        return result
+
+
+# =============================================================================
 # ANALYSIS PIPELINE
 # =============================================================================
 
@@ -379,6 +420,205 @@ class AnalysisPipeline:
             self._print_summary(states)
 
         return cached_results + self._collect_batch_results(states)
+
+    # =========================================================================
+    # MULTI-MODEL ORCHESTRATION
+    # =========================================================================
+
+    def run_multi_model(self, classes: list[str]) -> list[MultiModelResult]:
+        """Run analysis across multiple classifier models.
+
+        1. First model runs the full pipeline (images, edits, classification).
+        2. Additional models re-classify the same images and edits.
+        3. Returns MultiModelResult per class with per-model results.
+        """
+        model_names = self.cfg.classifier_models
+        primary = model_names[0]
+        additional = model_names[1:]
+
+        # Phase A: run full pipeline with primary model
+        self.cfg.classifier_model = primary
+        print(f"\n--- Primary model: {primary} ---")
+        primary_results = self.run(classes)
+        self._save_dataset_manifest(primary_results, primary)
+
+        # Phase B: re-classify for each additional model
+        additional_results: dict[str, list[ClassAnalysisResult]] = {}
+        for model_name in additional:
+            print(f"\n--- Re-classifying with: {model_name} ---")
+            reclass = self._reclassify_all(primary_results, model_name)
+            additional_results[model_name] = reclass
+
+        # Phase C: assemble MultiModelResult per class
+        return self._assemble_multi_results(
+            primary, primary_results, additional_results,
+        )
+
+    def _reclassify_all(
+        self, primary_results: list[ClassAnalysisResult], model_name: str,
+    ) -> list[ClassAnalysisResult]:
+        """Re-classify all images/edits from primary results with a new model."""
+        clf = self.models.classifier(model_name)
+        results = []
+        for primary in tqdm(primary_results, desc=f"  {model_name}", unit="class"):
+            result = self._reclassify_one_class(clf, primary, model_name)
+            results.append(result)
+        self.models.offload_classifier(model_name)
+        return results
+
+    def _reclassify_one_class(
+        self, clf, primary: ClassAnalysisResult, model_name: str,
+    ) -> ClassAnalysisResult:
+        """Re-classify one class's images with a different classifier."""
+        result = ClassAnalysisResult(class_name=primary.class_name)
+        result.detected_features = primary.detected_features
+        result.essential_features = list(primary.essential_features)
+        result.knowledge_based_features = list(primary.knowledge_based_features)
+        result.gradcam_summary = primary.gradcam_summary
+
+        result.baseline_results = self._reclassify_baselines(
+            clf, primary.baseline_results, primary.class_name,
+        )
+        result.edit_results = self._reclassify_edits(
+            clf, primary.edit_results, primary.class_name,
+        )
+        result.finalize()
+
+        self._save_checkpoint(result, model_name=model_name)
+        return result
+
+    def _reclassify_baselines(
+        self, clf, baselines: list[dict], class_name: str,
+    ) -> list[dict]:
+        """Re-classify baseline images with a different classifier."""
+        new_baselines = []
+        for br in baselines:
+            path = br.get("image_path", "")
+            if not path or not Path(path).exists():
+                continue
+            img = Image.open(path).convert("RGB")
+            pred = clf.predict(img, target_class_name=class_name,
+                               top_k=self.cfg.top_k_classes, compute_gradcam=False)
+            conf = clf.get_class_confidence(img, class_name)
+            record = self._base_record(path, br.get("true_label", ""), pred, conf)
+            record["type"] = br.get("type", "positive")
+            if "for_editing" in br:
+                record["for_editing"] = br["for_editing"]
+            if "confusing_class" in br:
+                record["confusing_class"] = br["confusing_class"]
+            new_baselines.append(record)
+        return new_baselines
+
+    def _reclassify_edits(
+        self, clf, edit_results: list[EditResult], class_name: str,
+    ) -> list[EditResult]:
+        """Re-classify all edited images with a different classifier."""
+        new_edits = []
+        for er in edit_results:
+            new_er = self._reclassify_one_edit(clf, er, class_name)
+            if new_er:
+                new_edits.append(new_er)
+        return new_edits
+
+    def _reclassify_one_edit(
+        self, clf, er: EditResult, class_name: str,
+    ) -> EditResult | None:
+        """Re-classify one edit result with a different classifier."""
+        orig_conf = self._measure_original(clf, er.original_image_path, class_name)
+        if orig_conf is None:
+            return None
+        new_gens = self._remeasure_generations(clf, er.generations, orig_conf, class_name)
+        if not new_gens:
+            return None
+        new_er = self._build_reclassified_result(er, orig_conf, new_gens, class_name)
+        new_er.feature_type = er.feature_type
+        new_er.feature_name = er.feature_name
+        return new_er
+
+    def _measure_original(self, clf, path: str, class_name: str) -> float | None:
+        """Load original image and return classifier confidence, or None."""
+        if not path or not Path(path).exists():
+            return None
+        img = Image.open(path).convert("RGB")
+        return clf.get_class_confidence(img, class_name)
+
+    def _remeasure_generations(self, clf, generations, orig_conf, class_name):
+        """Re-measure all generations with a different classifier."""
+        results = []
+        for gen in generations:
+            if not gen.edited_image_path or not Path(gen.edited_image_path).exists():
+                continue
+            img = Image.open(gen.edited_image_path).convert("RGB")
+            conf = clf.get_class_confidence(img, class_name)
+            results.append(GenerationResult(
+                seed=gen.seed, edited_confidence=conf,
+                delta=round(conf - orig_conf, 4),
+                edited_image_path=gen.edited_image_path,
+            ))
+        return results
+
+    def _build_reclassified_result(self, er, orig_conf, new_gens, class_name):
+        """Build EditResult from reclassified generations."""
+        instr = EditInstruction(
+            edit=er.instruction, hypothesis=er.hypothesis,
+            type=er.edit_type, target=er.target_type,
+            priority=er.priority, image_index=0,
+            source_class=er.source_class,
+        )
+        return self._build_edit_result(
+            instr, orig_conf, er.original_image_path, new_gens,
+            class_name=class_name,
+        )
+
+    def _assemble_multi_results(
+        self, primary_name: str,
+        primary_results: list[ClassAnalysisResult],
+        additional: dict[str, list[ClassAnalysisResult]],
+    ) -> list[MultiModelResult]:
+        """Combine per-model results into MultiModelResult per class."""
+        multi = []
+        for i, primary_r in enumerate(primary_results):
+            mr = MultiModelResult(class_name=primary_r.class_name)
+            mr.per_model[primary_name] = primary_r
+            for model_name, model_results in additional.items():
+                if i < len(model_results):
+                    mr.per_model[model_name] = model_results[i]
+            multi.append(mr)
+        return multi
+
+    def _save_dataset_manifest(
+        self, results: list[ClassAnalysisResult], model_name: str,
+    ):
+        """Save shared dataset manifest with images, edit prompts, metadata."""
+        self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = self._build_manifest(results, model_name)
+        path = self.cfg.output_dir / "dataset.json"
+        path.write_text(json.dumps(manifest, indent=2, default=str))
+        logger.info("Saved dataset manifest: %s", path)
+
+    def _build_manifest(self, results: list[ClassAnalysisResult], model_name: str) -> dict:
+        """Build dataset manifest structure from analysis results."""
+        return {
+            "primary_model": model_name,
+            "models_analyzed": self.cfg.classifier_models,
+            "classes": [r.class_name for r in results],
+            "per_class": {
+                r.class_name: self._class_manifest(r) for r in results
+            },
+        }
+
+    @staticmethod
+    def _class_manifest(r: ClassAnalysisResult) -> dict:
+        """Build manifest entry for one class."""
+        originals = [br.get("image_path", "") for br in r.baseline_results if br.get("image_path")]
+        edits = [
+            {"instruction": er.instruction, "hypothesis": er.hypothesis,
+             "edit_type": er.edit_type, "target_type": er.target_type,
+             "original_image_path": er.original_image_path}
+            for er in r.edit_results
+        ]
+        edited_imgs = [g.edited_image_path for er in r.edit_results for g in er.generations]
+        return {"original_images": originals, "edits": edits, "edited_images": edited_imgs}
 
     def _print_summary(self, states: list[BatchClassState]):
         """Print a summary of what was processed."""
@@ -650,6 +890,7 @@ class AnalysisPipeline:
         orig_gradcam = self._save_original_gradcam(inp, ctx)
         er = self._build_edit_result(
             inp.instruction, inp.original_confidence, orig_path, gens,
+            class_name=state.class_name,
         )
         er.original_gradcam_path = orig_gradcam
         return er
@@ -676,7 +917,7 @@ class AnalysisPipeline:
         """Classify features and run final analysis for one class."""
         if not state.result.edit_results or not state.images.positives:
             state.result.finalize()
-            self._save_checkpoint(state.result, state.class_dir)
+            self._save_checkpoint(state.result)
             return
         self._classify_features_inner(state.class_name, state.result.edit_results)
         base_image = state.images.positives[0][0]
@@ -685,7 +926,7 @@ class AnalysisPipeline:
         )
         state.result.apply_final_analysis(final)
         state.result.finalize()
-        self._save_checkpoint(state.result, state.class_dir)
+        self._save_checkpoint(state.result)
         self._log_completion(state.result)
 
     def _classify_features_inner(self, class_name: str, edit_results: list[EditResult]):
@@ -734,7 +975,7 @@ class AnalysisPipeline:
 
         self._run_all_phases(class_name, images, result, class_dir)
         result.finalize()
-        self._save_checkpoint(result, class_dir)
+        self._save_checkpoint(result)
         self._log_completion(result)
         return result
 
@@ -763,15 +1004,10 @@ class AnalysisPipeline:
     def _sample_images(self, class_name: str) -> ImageSet:
         """Sample positive images for analysis (negatives added after baseline)."""
         sampler = self.models.sampler()
-        effective_inspect = max(self.cfg.inspect_samples, self.cfg.samples_per_class)
-        all_positives = sampler.sample_positive(class_name, n=effective_inspect)
+        all_positives = sampler.sample_positive(class_name, n=self.cfg.samples_per_class)
         if not all_positives:
             return ImageSet()
-
-        return ImageSet(
-            inspect=all_positives[:effective_inspect],
-            edit=all_positives[:self.cfg.samples_per_class],
-        )
+        return ImageSet(inspect=all_positives)
 
     def _find_confusing_classes(self, class_name: str, edit_images: list) -> list[str]:
         """Combine classifier and VLM confusing classes."""
@@ -856,11 +1092,11 @@ class AnalysisPipeline:
             desc=f"    {class_name}: Inspect+GradCAM", leave=False, unit="img",
         ):
             pred = clf.predict(img, target_class_name=class_name, top_k=self.cfg.top_k_classes, compute_gradcam=True)
-            conf = clf.get_class_confidence(img, class_name)
             self._save_positive_image(img, pred, class_dir, i)
-            record = self._base_record(str((class_dir / f"pos_{i}_original.jpg").resolve()), true_label, pred, conf)
+            jpeg_path = class_dir / f"pos_{i}_original.jpg"
+            conf = self._jpeg_confidence(jpeg_path, class_name)
+            record = self._base_record(str(jpeg_path.resolve()), true_label, pred, conf)
             record["type"] = "positive"
-            record["for_editing"] = i < self.cfg.samples_per_class
             records.append(record)
             images.annotated_inspect.append((img, pred, true_label))
         return records
@@ -874,17 +1110,23 @@ class AnalysisPipeline:
             desc=f"    {class_name}: Negatives", leave=False, unit="img",
         ):
             pred = clf.predict(img, target_class_name=class_name, top_k=self.cfg.top_k_classes, compute_gradcam=False)
-            conf = clf.get_class_confidence(img, class_name)
-            if conf < self.cfg.min_negative_confidence:
-                continue
             orig_path = class_dir / f"neg_{i}_original.jpg"
             img.save(orig_path)
+            conf = self._jpeg_confidence(orig_path, class_name)
+            if conf < self.cfg.min_negative_confidence:
+                continue
             record = self._base_record(str(orig_path), true_label, pred, conf)
             record["type"] = "negative"
             record["confusing_class"] = true_label
             records.append(record)
             images.annotated_negatives.append((img, pred, true_label))
         return records
+
+    def _jpeg_confidence(self, jpeg_path: Path, class_name: str) -> float:
+        """Re-classify from saved JPEG to get compression-consistent confidence."""
+        clf = self.models.classifier()
+        saved_img = Image.open(jpeg_path).convert("RGB")
+        return clf.get_class_confidence(saved_img, class_name)
 
     def _save_positive_image(self, img, pred, class_dir: Path, index: int):
         """Save original image and its Grad-CAM overlay."""
@@ -984,6 +1226,7 @@ class AnalysisPipeline:
         self._current_detected = result.detected_features
         inputs = self._generate_positive_edits(class_name, images.positives, result.baseline_results)
         inputs += self._generate_negative_edits(class_name, images, result.baseline_results)
+        inputs += self._generate_environmental_edits(class_name, images, result)
         return inputs
 
     def _generate_positive_edits(
@@ -1067,6 +1310,50 @@ class AnalysisPipeline:
             instr.source_class = sample.true_label
         return [EditInput(sample.image, instr, sample.confidence) for instr in analysis.edit_instructions]
 
+    def _generate_environmental_edits(
+        self, class_name: str, images: ImageSet, result: ClassAnalysisResult,
+    ) -> list[EditInput]:
+        """Generate environmental removal edits from cross-sample pattern analysis."""
+        patterns = self._analyze_environmental_patterns(class_name, images)
+        result.environmental_patterns = [vars(p) for p in patterns]
+        return self._convert_patterns_to_edits(patterns, images, result.baseline_results)
+
+    def _analyze_environmental_patterns(
+        self, class_name: str, images: ImageSet,
+    ) -> list[EnvironmentalPattern]:
+        """Ask VLM to find recurring environmental patterns across samples."""
+        sample_images = [img for img, _, _ in images.annotated_inspect]
+        if len(sample_images) < 3:
+            return []
+        vlm = self.models.vlm()
+        return vlm.analyze_environmental_patterns(sample_images, class_name)
+
+    def _convert_patterns_to_edits(
+        self, patterns: list[EnvironmentalPattern],
+        images: ImageSet, baseline: list[dict],
+    ) -> list[EditInput]:
+        """Convert environmental patterns into removal edits on positive images."""
+        inputs = []
+        positives = images.annotated_inspect[:2]
+        for pattern in patterns:
+            for idx, (img, pred, _) in enumerate(positives):
+                instr = self._pattern_to_instruction(pattern, idx)
+                inputs.append(EditInput(img, instr, baseline[idx]["class_confidence"]))
+        return inputs
+
+    def _pattern_to_instruction(
+        self, pattern: EnvironmentalPattern, image_index: int,
+    ) -> EditInstruction:
+        """Create an EditInstruction from a single environmental pattern."""
+        return EditInstruction(
+            edit=pattern.removal_edit,
+            hypothesis=pattern.hypothesis,
+            type="environment_removal",
+            target="positive",
+            priority=4,
+            image_index=image_index,
+        )
+
     def _to_detected_features(self, feature_dicts: list[dict]) -> list[DetectedFeature]:
         """Convert feature dicts to DetectedFeature objects."""
         return [
@@ -1125,7 +1412,10 @@ class AnalysisPipeline:
         generations = self._generate_edit_variants(inp, ctx)
         if not generations:
             return None
-        result = self._build_edit_result(inp.instruction, inp.original_confidence, orig_path, generations)
+        result = self._build_edit_result(
+            inp.instruction, inp.original_confidence, orig_path, generations,
+            class_name=ctx.class_name,
+        )
         result.original_gradcam_path = orig_gradcam_path
         return result
 
@@ -1257,14 +1547,28 @@ class AnalysisPipeline:
 
     def _expected_direction(self, instr: EditInstruction) -> str:
         """Determine expected direction of confidence change."""
-        if instr.target == "positive" and instr.type == "feature_removal":
-            return "negative"
         if instr.target == "negative" or instr.type == "feature_addition":
             return "positive"
+        if instr.target == "positive":
+            return "negative"
         return "any"
 
-    def _build_edit_result(self, instr, orig_conf: float, orig_path: str, generations: list[GenerationResult]) -> EditResult:
+    def _build_edit_result(
+        self, instr, orig_conf: float, orig_path: str,
+        generations: list[GenerationResult], class_name: str = "",
+    ) -> EditResult:
         """Assemble final EditResult from components."""
+        stats = self._compute_delta_stats(instr, generations, class_name)
+        return EditResult(
+            instruction=instr.edit, hypothesis=instr.hypothesis,
+            edit_type=instr.type, target_type=instr.target, source_class=instr.source_class,
+            priority=instr.priority, original_confidence=orig_conf,
+            original_image_path=orig_path, generations=generations,
+            **stats,
+        )
+
+    def _compute_delta_stats(self, instr, generations, class_name) -> dict:
+        """Compute delta statistics and significance for an edit."""
         deltas = [g.delta for g in generations]
         mean_delta = round(sum(deltas) / len(deltas), 4)
         std_delta = round(float(np.std(deltas, ddof=1)), 4) if len(deltas) > 1 else 0.0
@@ -1272,17 +1576,16 @@ class AnalysisPipeline:
         is_likely_failed = abs(mean_delta) < self.cfg.min_meaningful_delta
         count = sum(1 for g in generations if self._validate_direction(instr, g.delta))
         sig = self._compute_significance(deltas, instr, is_likely_failed, count)
-
-        return EditResult(
-            instruction=instr.edit, hypothesis=instr.hypothesis,
-            edit_type=instr.type, target_type=instr.target, source_class=instr.source_class,
-            priority=instr.priority, original_confidence=orig_conf,
-            original_image_path=orig_path, generations=generations,
-            mean_edited_confidence=mean_conf,
-            mean_delta=mean_delta, std_delta=std_delta,
-            min_delta=round(min(deltas), 4), max_delta=round(max(deltas), 4),
-            likely_failed=is_likely_failed, **sig,
-        )
+        is_tautological = _is_tautological_edit(instr.edit, class_name)
+        if is_tautological and instr.target != "negative":
+            sig["confirmed"] = False
+        return {
+            "mean_edited_confidence": mean_conf,
+            "mean_delta": mean_delta, "std_delta": std_delta,
+            "min_delta": round(min(deltas), 4), "max_delta": round(max(deltas), 4),
+            "likely_failed": is_likely_failed, "tautological": is_tautological,
+            **sig,
+        }
 
     def _compute_significance(self, deltas, instr, is_likely_failed, count) -> dict:
         """Compute statistical and practical significance of an edit."""
@@ -1302,10 +1605,11 @@ class AnalysisPipeline:
             "effect_size": stat.effect_size_interpretation,
             "statistically_significant": stat.statistically_significant,
             "practically_significant": stat.practically_significant,
+            "validation_method": "statistical",
         }
 
     def _threshold_sig(self, deltas, is_likely_failed, count) -> dict:
-        """Compute significance using simple threshold check."""
+        """Compute significance using simple threshold check (no statistics)."""
         mean_delta = sum(deltas) / len(deltas)
         return {
             "confirmed": (count > len(deltas) / 2) and not is_likely_failed,
@@ -1313,6 +1617,7 @@ class AnalysisPipeline:
             "p_value": 1.0, "cohens_d": 0.0, "effect_size": "unknown",
             "statistically_significant": False,
             "practically_significant": abs(mean_delta) >= self.cfg.confidence_delta_threshold,
+            "validation_method": "threshold",
         }
 
     # =========================================================================
@@ -1437,32 +1742,33 @@ class AnalysisPipeline:
 
     def _validate_direction(self, instr: EditInstruction, delta: float) -> bool:
         """Check if confidence change matches expected direction."""
-        threshold = self.cfg.confidence_delta_threshold
         if instr.target == "positive":
-            if instr.type == "feature_removal":
-                return delta <= -threshold
+            threshold = self.cfg.confidence_delta_threshold
             if instr.type == "feature_addition":
                 return delta >= threshold
-            return abs(delta) >= threshold
-        return delta >= threshold
+            return delta <= -threshold
+        return delta >= self.cfg.negative_delta_threshold
 
     # =========================================================================
     # PERSISTENCE
     # =========================================================================
 
     def _make_class_dir(self, class_name: str) -> Path:
-        """Create and return the output directory for a class."""
-        class_dir = (self.cfg.output_dir / class_name.replace(" ", "_")).resolve()
+        """Create and return the image directory for a class."""
+        class_dir = (self.cfg.images_dir / class_name.replace(" ", "_")).resolve()
         class_dir.mkdir(parents=True, exist_ok=True)
         return class_dir
 
-    def _checkpoint_path(self, class_name: str) -> Path:
+    def _checkpoint_path(self, class_name: str, model_name: str | None = None) -> Path:
         """Get path to checkpoint file for a class."""
-        return self.cfg.output_dir / class_name.replace(" ", "_") / "analysis.json"
+        model = model_name or self.cfg.classifier_model
+        ckpt_dir = self.cfg.model_checkpoint_dir(model)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        return ckpt_dir / f"{class_name.replace(' ', '_')}.json"
 
-    def _save_checkpoint(self, result: ClassAnalysisResult, class_dir: Path):
+    def _save_checkpoint(self, result: ClassAnalysisResult, model_name: str | None = None):
         """Save analysis result to JSON checkpoint."""
-        path = class_dir / "analysis.json"
+        path = self._checkpoint_path(result.class_name, model_name)
         path.write_text(json.dumps(result.to_dict(), indent=2, default=str))
 
     def _load_checkpoint(self, class_name: str) -> ClassAnalysisResult | None:

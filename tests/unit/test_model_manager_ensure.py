@@ -77,7 +77,7 @@ class TestLoadToGpuIntegration:
         mock_instance = MagicMock()
         mock_instance.loaded = False
         MockCls.return_value = mock_instance
-        mm._classifier = mock_instance
+        mm._classifiers["resnet50"] = mock_instance
         mm.classifier()
         mock_instance.load_to_gpu.assert_called_once()
 
@@ -109,7 +109,7 @@ class TestLoadToGpuIntegration:
         mm = ModelManager(config_high_vram)
         mock_instance = MagicMock()
         mock_instance.loaded = True
-        mm._classifier = mock_instance
+        mm._classifiers["resnet50"] = mock_instance
         result = mm.classifier()
         mock_instance.load_to_gpu.assert_not_called()
         assert result is mock_instance
@@ -119,10 +119,11 @@ class TestOffloadNoop:
     @patch("src.model_manager.torch")
     def test_offload_classifier_noop_when_not_loaded(self, mock_torch, config):
         mm = ModelManager(config)
-        mm._classifier = MagicMock()
-        mm._classifier.loaded = False
+        mock_clf = MagicMock()
+        mock_clf.loaded = False
+        mm._classifiers["resnet50"] = mock_clf
         mm.offload_classifier()
-        mm._classifier.offload.assert_not_called()
+        mock_clf.offload.assert_not_called()
 
     @patch("src.model_manager.torch")
     def test_offload_vlm_noop_when_not_loaded(self, mock_torch, config):

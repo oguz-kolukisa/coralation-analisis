@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
-from src.dataset import ImageNetSampler
+from src.dataset import ImageNetSampler, _matches_label
 
 
 def _make_mock_dataset(label_field="label", image_field="image", items=None):
@@ -107,12 +107,25 @@ class TestFindLabelIndex:
         idx = sampler.find_label_index("cat")
         assert idx == 0
 
-    def test_substring_match(self):
+    def test_partial_word_no_match(self):
         ds = _make_mock_dataset()
         sampler = _make_sampler(ds)
         sampler._label_names = ["tabby cat", "golden retriever"]
         idx = sampler.find_label_index("tabby")
-        assert idx == 0
+        assert idx is None
+
+    def test_synonym_match(self):
+        ds = _make_mock_dataset()
+        sampler = _make_sampler(ds)
+        sampler._label_names = ["cockroach, roach", "cock"]
+        assert sampler.find_label_index("roach") == 0
+        assert sampler.find_label_index("cock") == 1
+
+    def test_cock_does_not_match_cockroach(self):
+        ds = _make_mock_dataset()
+        sampler = _make_sampler(ds)
+        sampler._label_names = ["cock", "cockroach, roach", "peacock"]
+        assert sampler.find_label_index("cock") == 0
 
     def test_not_found_returns_none(self):
         ds = _make_mock_dataset()
@@ -126,12 +139,18 @@ class TestFindLabelIndex:
 # ============================================================================
 
 class TestFindLabelIndices:
-    def test_finds_multiple(self):
+    def test_finds_multiple_by_synonym(self):
         ds = _make_mock_dataset()
         sampler = _make_sampler(ds)
-        sampler._label_names = ["tiger shark", "hammerhead shark", "cat"]
-        indices = sampler.find_label_indices("shark")
-        assert set(indices) == {0, 1}
+        sampler._label_names = ["cat, feline", "dog, canine", "wild cat, feline"]
+        indices = sampler.find_label_indices("feline")
+        assert set(indices) == {0, 2}
+
+    def test_cock_indices_exclude_cockroach(self):
+        ds = _make_mock_dataset()
+        sampler = _make_sampler(ds)
+        sampler._label_names = ["cock", "cockroach, roach", "peacock"]
+        assert sampler.find_label_indices("cock") == [0]
 
     def test_no_match_returns_empty(self):
         ds = _make_mock_dataset()
@@ -258,3 +277,36 @@ class TestSampleFromClasses:
 
         results = sampler.sample_from_classes(["xyz"], n_per_class=1)
         assert results == []
+
+
+# ============================================================================
+# _matches_label (pure function)
+# ============================================================================
+
+class TestMatchesLabel:
+    def test_exact_synonym(self):
+        assert _matches_label("roach", "cockroach, roach") is True
+
+    def test_no_substring_match(self):
+        assert _matches_label("cock", "cockroach, roach") is False
+
+    def test_full_label_match(self):
+        assert _matches_label("cockroach, roach", "cockroach, roach") is True
+
+    def test_case_insensitive(self):
+        assert _matches_label("COCK", "cock") is True
+
+    def test_no_partial_word(self):
+        assert _matches_label("cock", "peacock") is False
+
+    def test_tick_does_not_match_lipstick(self):
+        assert _matches_label("tick", "lipstick") is False
+
+    def test_tick_does_not_match_joystick(self):
+        assert _matches_label("tick", "joystick") is False
+
+    def test_short_synonym_exact(self):
+        assert _matches_label("bee", "bee") is True
+
+    def test_bee_does_not_match_bee_eater(self):
+        assert _matches_label("bee", "bee eater") is False

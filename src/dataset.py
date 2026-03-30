@@ -44,6 +44,16 @@ def suppress_output():
             tqdm.tqdm.__init__ = original_tqdm_init
 
 
+def _matches_label(query: str, label: str) -> bool:
+    """Check if query matches label by exact synonym matching."""
+    query_lower = query.lower().strip()
+    label_lower = label.lower().strip()
+    if query_lower == label_lower:
+        return True
+    synonyms = [s.strip() for s in label_lower.split(",")]
+    return query_lower in synonyms
+
+
 class ImageNetSampler:
     """
     Streams samples from HuggingFace datasets without downloading the full dataset.
@@ -115,20 +125,18 @@ class ImageNetSampler:
         return self._label_names
 
     def find_label_index(self, class_name: str) -> int | None:
-        """Find the numeric label index for a class name (case-insensitive substring)."""
+        """Find the numeric label index for a class name (exact synonym match)."""
         names = self.get_label_names()
-        name_lower = class_name.lower()
-        for i, n in enumerate(names):
-            if name_lower in n.lower() or n.lower() in name_lower:
+        for i, label in enumerate(names):
+            if _matches_label(class_name, label):
                 return i
         return None
 
     def find_label_indices(self, class_name: str) -> list[int]:
-        """Return all matching label indices (for classes with multiple HF entries)."""
+        """Return all matching label indices (exact synonym match)."""
         names = self.get_label_names()
-        name_lower = class_name.lower()
-        return [i for i, n in enumerate(names)
-                if name_lower in n.lower() or n.lower() in name_lower]
+        return [i for i, label in enumerate(names)
+                if _matches_label(class_name, label)]
 
     def sample_positive(self, class_name: str, n: int = 5) -> list[tuple[Image.Image, str]]:
         """Return up to n images that belong to the given class."""

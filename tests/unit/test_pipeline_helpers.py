@@ -37,8 +37,16 @@ class TestExpectedDirection:
         instr = make_instruction(target="positive", edit_type="feature_addition")
         assert pipeline._expected_direction(instr) == "positive"
 
-    def test_unknown_type_expects_any(self, pipeline):
-        instr = make_instruction(target="positive", edit_type="background_change")
+    def test_positive_modification_expects_negative(self, pipeline):
+        instr = make_instruction(target="positive", edit_type="modification")
+        assert pipeline._expected_direction(instr) == "negative"
+
+    def test_positive_replacement_expects_negative(self, pipeline):
+        instr = make_instruction(target="positive", edit_type="replacement")
+        assert pipeline._expected_direction(instr) == "negative"
+
+    def test_unknown_target_expects_any(self, pipeline):
+        instr = make_instruction(target="unknown", edit_type="background_change")
         assert pipeline._expected_direction(instr) == "any"
 
 
@@ -74,6 +82,41 @@ class TestValidateDirection:
     def test_zero_delta_invalid(self, pipeline):
         instr = make_instruction(target="positive", edit_type="feature_removal")
         assert pipeline._validate_direction(instr, 0.0) is False
+
+    def test_modification_positive_delta_invalid(self, pipeline):
+        """Enhancing a class feature should NOT count as confirmed."""
+        instr = make_instruction(target="positive", edit_type="modification")
+        assert pipeline._validate_direction(instr, 0.20) is False
+
+    def test_modification_negative_delta_valid(self, pipeline):
+        """Changing a feature that drops confidence IS confirmed."""
+        instr = make_instruction(target="positive", edit_type="modification")
+        assert pipeline._validate_direction(instr, -0.20) is True
+
+    def test_replacement_positive_delta_invalid(self, pipeline):
+        """Replacing a feature that increases confidence is NOT a shortcut."""
+        instr = make_instruction(target="positive", edit_type="replacement")
+        assert pipeline._validate_direction(instr, 0.30) is False
+
+    def test_replacement_negative_delta_valid(self, pipeline):
+        instr = make_instruction(target="positive", edit_type="replacement")
+        assert pipeline._validate_direction(instr, -0.15) is True
+
+    def test_negative_context_addition_positive_delta_valid(self, pipeline):
+        """Adding context to negative image that increases conf IS a shortcut."""
+        instr = make_instruction(target="negative", edit_type="context_addition")
+        assert pipeline._validate_direction(instr, 0.20) is True
+
+    def test_negative_context_addition_negative_delta_invalid(self, pipeline):
+        instr = make_instruction(target="negative", edit_type="context_addition")
+        assert pipeline._validate_direction(instr, -0.10) is False
+
+    def test_negative_uses_lower_threshold(self, pipeline):
+        """Negative edits use negative_delta_threshold (0.05), not 0.15."""
+        instr = make_instruction(target="negative", edit_type="context_addition")
+        assert pipeline._validate_direction(instr, 0.10) is True
+        assert pipeline._validate_direction(instr, 0.05) is True
+        assert pipeline._validate_direction(instr, 0.04) is False
 
 
 # =========================================================================
@@ -241,7 +284,8 @@ class TestThresholdSig:
     def test_returns_expected_keys(self, pipeline):
         result = pipeline._threshold_sig([-0.1], False, 1)
         expected_keys = {"confirmed", "confirmation_count", "p_value", "cohens_d",
-                         "effect_size", "statistically_significant", "practically_significant"}
+                         "effect_size", "statistically_significant", "practically_significant",
+                         "validation_method"}
         assert set(result.keys()) == expected_keys
 
     def test_static_values(self, pipeline):
@@ -445,3 +489,49 @@ class TestFindConfusingFromBaseline:
         ]
         result = pipeline._find_confusing_from_baseline("cat", baseline)
         assert len(result) <= 2
+
+
+# =========================================================================
+# _jpeg_confidence
+# =========================================================================
+
+class TestJpegConfidence:
+    def test_reads_saved_jpeg_and_classifies(self, pipeline, tmp_path):
+        """Confidence comes from the saved JPEG, not the in-memory image."""
+        img = make_image(size=(64, 64), color="blue")
+        jpeg_path = tmp_path / "test.jpg"
+        img.save(jpeg_path)
+
+        mock_clf = MagicMock()
+        mock_clf.get_class_confidence.return_value = 0.42
+        pipeline.models.classifier.return_value = mock_clf
+
+        result = pipeline._jpeg_confidence(jpeg_path, "tench")
+
+        assert result == 0.42
+        mock_clf.get_class_confidence.assert_called_once()
+        call_args = mock_clf.get_class_confidence.call_args
+        assert call_args[1] == {} or len(call_args[0]) == 2
+        assert call_args[0][1] == "tench"
+
+    def test_returns_different_conf_than_in_memory(self, pipeline, tmp_path):
+        """Verifies JPEG confidence differs from in-memory when mock differs."""
+        img = make_image()
+        jpeg_path = tmp_path / "test.jpg"
+        img.save(jpeg_path)
+
+        mock_clf = MagicMock()
+        call_count = [0]
+
+        def side_effect(image, class_name):
+            call_count[0] += 1
+            return 0.9 if call_count[0] == 1 else 0.85
+
+        mock_clf.get_class_confidence.side_effect = side_effect
+        pipeline.models.classifier.return_value = mock_clf
+
+        in_memory_conf = mock_clf.get_class_confidence(img, "cat")
+        jpeg_conf = pipeline._jpeg_confidence(jpeg_path, "cat")
+
+        assert in_memory_conf == 0.9
+        assert jpeg_conf == 0.85

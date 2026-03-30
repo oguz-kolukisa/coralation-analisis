@@ -29,7 +29,7 @@ def cfg(tmp_path, device):
     return Config(
         device=device, low_vram=True, output_dir=tmp_path,
         resume=False, use_statistical_validation=False,
-        samples_per_class=1, inspect_samples=1,
+        samples_per_class=1,
         generations_per_edit=1, max_hypotheses_per_image=1,
         compute_edit_gradcam=True,
     )

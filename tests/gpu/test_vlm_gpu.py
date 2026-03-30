@@ -201,13 +201,17 @@ class TestParseIterativeAnalysis:
 
 
 class TestFallbackClassify:
-    def test_returns_empty_string(self):
+    def test_contextual_keyword_returns_contextual(self):
         obj = object.__new__(QwenVLAnalyzer)
-        assert obj._fallback_classify("Remove the background") == ""
+        assert obj._fallback_classify("Remove the background") == "contextual"
 
-    def test_returns_empty_for_any_input(self):
+    def test_no_keyword_returns_intrinsic(self):
         obj = object.__new__(QwenVLAnalyzer)
-        assert obj._fallback_classify("") == ""
+        assert obj._fallback_classify("Remove ears") == "intrinsic"
+
+    def test_empty_string_returns_intrinsic(self):
+        obj = object.__new__(QwenVLAnalyzer)
+        assert obj._fallback_classify("") == "intrinsic"
 
 
 # ============================================================================

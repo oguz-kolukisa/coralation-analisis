@@ -43,7 +43,8 @@ def load_classes_from_file(path: Path) -> list[str]:
 
 class Config(BaseModel):
     # --- Model settings ---
-    classifier_model: str = "resnet50"
+    classifier_model: str = "resnet50"              # single-model (backward compat)
+    classifier_models: list[str] = ["resnet50", "dinov2_vitb14_lc", "vit_l_16"]
     vlm_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"
     editor_model: str = "black-forest-labs/FLUX.2-klein-9b-kv"  # Fast, high-quality (4 steps)
 
@@ -52,8 +53,7 @@ class Config(BaseModel):
     hf_dataset_split: str = "validation"
     class_source: str = "json"          # "json" = read from file, "dataset" = query dataset labels
     class_file: Path = _DEFAULT_CLASS_FILE  # path to JSON class list (used when class_source="json")
-    samples_per_class: int = 100        # positive examples per class (for EDITING)
-    inspect_samples: int = 10           # images to INSPECT for feature discovery (separate from editing)
+    samples_per_class: int = 10          # positive images per class (used for inspection AND editing)
     top_negative_classes: int = 5       # how many confusing classes to select
     negative_samples_per_class: int = 5  # negative images to sample from each confusing class
     max_scan: int = 10000               # max samples to scan when searching for a class
@@ -62,11 +62,15 @@ class Config(BaseModel):
 
     # --- Analysis settings ---
     confidence_delta_threshold: float = 0.15   # min delta to "confirm" a hypothesis
+    negative_delta_threshold: float = 0.05    # lower threshold for negative-image edits (spurious detection)
     min_negative_confidence: float = 0.05      # min confidence for negative samples (filter out noise)
     min_meaningful_delta: float = 0.01         # deltas below this are considered failed edits
     top_k_classes: int = 5                      # how many top predictions to record
     max_hypotheses_per_image: int = 5           # VLM edit instructions per image
     max_edits_per_hypothesis: int = 3           # images to edit per hypothesis
+
+    # --- Environmental analysis settings ---
+    min_pattern_frequency: int = 3              # minimum images a pattern must appear in to be tested
 
     # --- Robustness settings ---
     generations_per_edit: int = 1               # images generated per edit instruction
@@ -106,6 +110,30 @@ class Config(BaseModel):
     low_vram: bool = True               # if True, load/offload models one at a time (for <32GB VRAM)
 
     model_config = {"arbitrary_types_allowed": True}
+
+    @property
+    def images_dir(self) -> Path:
+        """Directory for all class image subdirectories."""
+        return self.output_dir / "images"
+
+    @property
+    def checkpoints_dir(self) -> Path:
+        """Directory for per-model checkpoint files."""
+        return self.output_dir / "checkpoints"
+
+    @property
+    def reports_dir(self) -> Path:
+        """Directory for all reports."""
+        return self.output_dir / "reports"
+
+    def model_checkpoint_dir(self, model_name: str) -> Path:
+        """Per-model checkpoint directory (flat JSON files)."""
+        return self.checkpoints_dir / model_name
+
+    @property
+    def is_multi_model(self) -> bool:
+        """Whether multiple classifiers are configured."""
+        return len(self.classifier_models) > 1
 
 
 def get_config(**overrides) -> Config:
