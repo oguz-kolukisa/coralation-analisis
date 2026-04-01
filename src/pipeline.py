@@ -44,7 +44,8 @@ from .config import Config
 from .model_manager import ModelManager
 from .models.attention_maps import compute_attention_diff, render_diff_heatmap
 from .vlm import (
-    DetectedFeature, EditInstruction, EnvironmentalPattern, FinalAnalysis,
+    DetectedFeature, EditInstruction, EnvironmentalPattern, FeatureConcept,
+    FinalAnalysis,
 )
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,7 @@ class ClassAnalysisResult:
         if not final:
             return
         self.feature_importance = final.feature_importance
+        self._fix_intrinsic_classifications()
         self.robustness_score = final.robustness_score
         self.risk_level = final.risk_level
         self.vulnerabilities = final.vulnerabilities
@@ -269,12 +271,40 @@ class ClassAnalysisResult:
         self.final_summary = final.summary
         self._extract_shortcuts(final.confirmed_shortcuts)
 
+    def _fix_intrinsic_classifications(self):
+        """Override VLM misclassifications: intrinsic features are always essential."""
+        intrinsic_names = self._intrinsic_feature_names()
+        for fi in self.feature_importance:
+            name = fi.get("feature", "")
+            if self._is_intrinsic_feature(name, intrinsic_names):
+                fi["is_semantic"] = True
+                fi["classification"] = "essential"
+
     def _extract_shortcuts(self, shortcuts: list):
+        intrinsic_names = self._intrinsic_feature_names()
         for s in shortcuts:
             name = s.get("feature", str(s)) if isinstance(s, dict) else str(s)
+            if self._is_intrinsic_feature(name, intrinsic_names):
+                continue
             self.confirmed_shortcuts.append(name)
             if name not in self.spurious_features:
                 self.spurious_features.append(name)
+
+    def _intrinsic_feature_names(self) -> set[str]:
+        """Collect lowercase names of features discovered as intrinsic."""
+        return {
+            f["name"].lower()
+            for f in self.detected_features
+            if f.get("feature_type") == "intrinsic"
+        }
+
+    @staticmethod
+    def _is_intrinsic_feature(name: str, intrinsic_names: set[str]) -> bool:
+        """Check if a feature name matches any intrinsic feature."""
+        clean = name.lower().strip().removeprefix("the ")
+        return clean in intrinsic_names or any(
+            clean in n or n in clean for n in intrinsic_names
+        )
 
     def finalize(self):
         """Populate derived fields. Call after all phases complete."""
@@ -941,6 +971,17 @@ class AnalysisPipeline:
             if i < len(classified):
                 er.feature_type = classified[i].get("feature_type", "")
                 er.feature_name = classified[i].get("feature_name", "")
+        self._name_unnamed_features(vlm, class_name, edit_results)
+
+    def _name_unnamed_features(self, vlm, class_name: str, edit_results: list[EditResult]):
+        """Fill empty feature_name fields using VLM."""
+        unnamed = [er for er in edit_results if not er.feature_name]
+        if not unnamed:
+            return
+        edits = [{"instruction": er.instruction, "mean_delta": er.mean_delta} for er in unnamed]
+        names = vlm.name_features(class_name, edits)
+        for er, name in zip(unnamed, names):
+            er.feature_name = name
 
     def _collect_batch_results(self, states: list[BatchClassState]) -> list[ClassAnalysisResult]:
         """Collect results from all states (including failed ones)."""
@@ -1008,54 +1049,6 @@ class AnalysisPipeline:
         if not all_positives:
             return ImageSet()
         return ImageSet(inspect=all_positives)
-
-    def _find_confusing_classes(self, class_name: str, edit_images: list) -> list[str]:
-        """Combine classifier and VLM confusing classes."""
-        self._status("Finding confusing classes...")
-        classifier_classes = self._classifier_confusing_classes(class_name, edit_images)
-        vlm_classes = self._vlm_confusing_classes(class_name)
-        merged = self._merge_confusing_classes(classifier_classes, vlm_classes)
-        return merged[:self.cfg.top_negative_classes]
-
-    def _classifier_confusing_classes(self, class_name: str, edit_images: list) -> list[str]:
-        """Get confusing classes from classifier predictions."""
-        classifier = self.models.classifier()
-        counts = self._collect_confusion_counts(classifier, class_name, edit_images)
-        sorted_confusing = sorted(counts.items(), key=lambda x: -x[1])
-        return [label for label, _ in sorted_confusing]
-
-    def _collect_confusion_counts(self, classifier, class_name: str, images: list) -> dict:
-        """Count how often non-target classes appear in top-k predictions."""
-        counts: dict[str, int] = {}
-        for img, _ in images[:3]:
-            pred = classifier.predict(img, target_class_name=class_name, top_k=self.cfg.top_k_classes)
-            for label, conf in pred.top_k:
-                if label.lower() != class_name.lower() and conf > self.cfg.confusing_class_min_conf:
-                    counts[label] = counts.get(label, 0) + 1
-        return counts
-
-    def _vlm_confusing_classes(self, class_name: str) -> list[str]:
-        """Get confusing classes from VLM semantic knowledge."""
-        all_classes = self.models.sampler().get_label_names()
-        try:
-            candidates = self.models.vlm().select_confusing_classes(
-                class_name, all_classes, num_classes=self.cfg.top_negative_classes
-            )
-            return self._validate_class_names(candidates)
-        except Exception as e:
-            logger.warning("VLM confusing class selection failed for %s: %s", class_name, e)
-            return []
-
-    def _merge_confusing_classes(self, classifier_classes: list[str], vlm_classes: list[str]) -> list[str]:
-        """Deduplicate and merge confusing classes, classifier-first priority."""
-        seen: set[str] = set()
-        merged: list[str] = []
-        for name in classifier_classes + vlm_classes:
-            key = name.lower()
-            if key not in seen:
-                merged.append(name)
-                seen.add(key)
-        return merged
 
     def _validate_class_names(self, candidates: list[str]) -> list[str]:
         """Filter class names to those resolvable in ImageNet labels."""
@@ -1643,6 +1636,7 @@ class AnalysisPipeline:
             if i < len(classified):
                 er.feature_type = classified[i].get("feature_type", "")
                 er.feature_name = classified[i].get("feature_name", "")
+        self._name_unnamed_features(vlm, class_name, edit_results)
 
     def _run_final_analysis(
         self, class_name: str, result: ClassAnalysisResult, base_image: Image.Image,

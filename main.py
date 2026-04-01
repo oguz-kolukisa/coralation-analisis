@@ -28,6 +28,8 @@ import sys
 import warnings
 from pathlib import Path
 
+from src.__version__ import __version__
+
 import tqdm
 
 # Suppress specific warnings
@@ -38,7 +40,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
 from src.config import Config, load_hf_token, load_classes_from_file
 from src.pipeline import AnalysisPipeline
+from src.pipeline_v2 import PipelineV2
 from src.reporter import Reporter
+from src.reporter_v2 import ReporterV2
+from src.dataset_export import export_dataset_json, export_huggingface
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -149,6 +154,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Coralation: Automated bias/shortcut discovery for image classifiers"
     )
+    parser.add_argument("--version", action="version", version=f"coralation {__version__}")
 
     # Class selection
     class_group = parser.add_mutually_exclusive_group()
@@ -212,10 +218,6 @@ def main():
     parser.add_argument(
         "--editor", default="black-forest-labs/FLUX.2-klein-9b-kv",
         help="Image editor model (default: FLUX.2-klein, 4 steps)"
-    )
-    parser.add_argument(
-        "--iterations", type=int, default=2,
-        help="Number of VLM analysis iterations per class (default: 2)"
     )
     parser.add_argument(
         "--generations", type=int, default=1,
@@ -289,7 +291,6 @@ def main():
         negative_samples_per_class=args.negative_samples,
         confidence_delta_threshold=args.delta_threshold,
         max_hypotheses_per_image=args.max_hypotheses,
-        iterations=args.iterations,
         generations_per_edit=args.generations,
         low_vram=low_vram,
         attention_method=args.attention,
@@ -303,11 +304,10 @@ def main():
 
     # Print header
     print("\n" + "=" * 60)
-    print("  CORALATION - Model Bias/Shortcut Discovery")
+    print(f"  CORALATION v{__version__} - Model Bias/Shortcut Discovery")
     print("=" * 60)
     print(f"  Output:     {cfg.output_dir}")
     print(f"  Samples:    {cfg.samples_per_class} positive, {cfg.negative_samples_per_class}x{cfg.top_negative_classes} negative")
-    print(f"  Iterations: {cfg.iterations} per class")
     print(f"  Classifiers: {', '.join(cfg.classifier_models)}")
     print(f"  Threshold:  {cfg.confidence_delta_threshold}")
     print(f"  Generations: {cfg.generations_per_edit} per edit")
@@ -317,7 +317,7 @@ def main():
     print(f"  Pipeline:   phase-first (6 model swaps total)")
     print("=" * 60 + "\n")
 
-    pipeline = AnalysisPipeline(cfg)
+    pipeline = PipelineV2(cfg)
 
     # Determine which classes to analyze
     classes = resolve_classes(args, pipeline, cfg)
@@ -331,10 +331,65 @@ def main():
     start_time = datetime.now(timezone.utc)
     analysis_error = None
 
-    if cfg.is_multi_model:
-        multi_results = _run_multi_model(pipeline, classes, cfg, start_time)
-    else:
-        _run_single_model(pipeline, classes, cfg, start_time)
+    _run_analysis(pipeline, classes, cfg, start_time)
+
+
+def _run_analysis(pipeline, classes, cfg, start_time):
+    """Run V2 pipeline and generate reports."""
+    from datetime import datetime, timezone
+    import json as _json
+
+    _logger = logging.getLogger("coralation")
+    results = []
+    try:
+        results = pipeline.run(classes)
+    except Exception as e:
+        _logger.error("Pipeline failed: %s", e, exc_info=True)
+        print(f"\n Analysis error: {e}")
+
+    end_time = datetime.now(timezone.utc)
+    duration = end_time - start_time
+
+    # Save results
+    cfg.reports_dir.mkdir(parents=True, exist_ok=True)
+    results_dicts = [r.to_dict() for r in results]
+
+    json_path = cfg.reports_dir / "analysis_results.json"
+    output_payload = {
+        "version": __version__,
+        "generated_at": end_time.strftime("%Y-%m-%d %H:%M UTC"),
+        "results": results_dicts,
+    }
+    json_path.write_text(_json.dumps(output_payload, indent=2, default=str))
+
+    reporter = ReporterV2(cfg.reports_dir)
+    report_paths = reporter.generate_all(results_dicts, cfg.classifier_models)
+
+    # Dataset export
+    config_dict = cfg.model_dump() if hasattr(cfg, 'model_dump') else {}
+    export_dataset_json(results_dicts, config_dict, cfg.output_dir)
+    export_huggingface(results_dicts, cfg.output_dir)
+
+    # Print summary
+    total_edits = sum(len(r.edit_results) for r in results)
+    total_concepts = sum(len(r.unique_concepts) for r in results)
+    total_spurious = sum(
+        1 for r in results for er in r.edit_results
+        for v in er.verdict.values()
+        if isinstance(v, dict) and v.get("verdict") == "spurious"
+    )
+    print(f"\n{'=' * 60}")
+    print(f"  ANALYSIS COMPLETE")
+    print(f"{'=' * 60}")
+    print(f"  Classes analyzed:    {len(results)}")
+    print(f"  Features discovered: {total_concepts}")
+    print(f"  Edits tested:        {total_edits}")
+    print(f"  Spurious verdicts:   {total_spurious}")
+    print(f"  Duration:            {int(duration.total_seconds())}s")
+    for p in report_paths:
+        print(f"  Report:              {p}")
+    print(f"  JSON:                {json_path}")
+    print(f"{'=' * 60}\n")
 
 
 def _run_single_model(pipeline, classes, cfg, start_time):

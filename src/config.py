@@ -93,8 +93,6 @@ class Config(BaseModel):
     confusing_class_min_conf: float = 0.01      # min confidence to consider class "confusing"
     spurious_positive_delta: float = 0.10       # positive delta threshold to flag as spurious
 
-    # --- Iterative analysis ---
-    iterations: int = 2                         # number of VLM analysis iterations (1 = no iteration)
     verify_edits: bool = False                  # VLM edit verification disabled by default (slower, often unnecessary)
 
     # --- Paths ---

@@ -2,6 +2,35 @@
 
 ## Git Commits
 - Do NOT add `Co-Authored-By: Claude` to commit messages.
+- Do NOT commit or push unless the user explicitly asks. Never auto-commit.
+
+## Versioning
+
+**Source of truth**: `pyproject.toml` line `version = "X.Y.Z"` (semantic versioning).
+
+**Runtime access**: `from src.__version__ import __version__`
+
+### Version bump rules:
+- **Patch (0.1.X)**: Bug fixes, report formatting, prompt tweaks
+- **Minor (0.X.0)**: New features, new pipeline phases, new report sections, new output formats
+- **Major (X.0.0)**: Breaking changes to JSON output schema, CLI arguments, or pipeline architecture
+
+### When to bump:
+- Bump version in `pyproject.toml` **before committing** any user-visible change
+- Every commit that changes pipeline logic, report output, or CLI should include a version bump
+- Multiple small fixes can share one patch bump if committed together
+
+### Where version appears (keep in sync automatically):
+- `pyproject.toml` — single source of truth
+- `src/__version__.py` — reads from package metadata at runtime
+- CLI: `python main.py --version`
+- CLI header: printed at start of every run
+- All reports (HTML, MD): version + generation timestamp in header
+- JSON output: `analysis_results.json` has `version` and `generated_at` fields
+
+### Git tags:
+- After pushing a version bump, create a git tag: `git tag v0.2.0 && git push --tags`
+- Tag format: `vX.Y.Z` (e.g., `v0.2.0`)
 
 ## MANDATORY: Clean Code Enforcement (Every Code Change)
 

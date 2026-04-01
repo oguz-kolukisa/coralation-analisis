@@ -277,23 +277,6 @@ class TestValidateDirection:
 
 
 # ============================================================================
-# _merge_confusing_classes
-# ============================================================================
-
-class TestMergeConfusingClasses:
-    def test_deduplicates(self, pipeline):
-        result = pipeline._merge_confusing_classes(["Dog", "Cat"], ["dog", "Fish"])
-        assert len(result) == 3
-
-    def test_classifier_first(self, pipeline):
-        result = pipeline._merge_confusing_classes(["Dog"], ["dog"])
-        assert result == ["Dog"]
-
-    def test_empty_lists(self, pipeline):
-        assert pipeline._merge_confusing_classes([], []) == []
-
-
-# ============================================================================
 # Phase methods (mocked dependencies)
 # ============================================================================
 
@@ -440,16 +423,3 @@ class TestValidateClassNames:
 # _collect_confusion_counts
 # ============================================================================
 
-class TestCollectConfusionCounts:
-    def test_counts_non_target(self, pipeline):
-        clf = MagicMock()
-        pred = MagicMock()
-        pred.top_k = [("cat", 0.8), ("dog", 0.15), ("fish", 0.01)]
-        clf.predict.return_value = pred
-        pipeline.cfg.confusing_class_min_conf = 0.05
-
-        img = Image.new("RGB", (64, 64))
-        counts = pipeline._collect_confusion_counts(clf, "cat", [(img, "cat")])
-        assert "dog" in counts
-        assert "cat" not in counts
-        assert "fish" not in counts  # below threshold

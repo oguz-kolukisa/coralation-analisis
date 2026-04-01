@@ -178,50 +178,6 @@ class TestParseFinalAnalysis:
         assert result.risk_level == "MEDIUM"
 
 
-class TestParseIterativeAnalysis:
-    @pytest.fixture
-    def analyzer(self):
-        obj = object.__new__(QwenVLAnalyzer)
-        return obj
-
-    def test_parses_insights(self, analyzer):
-        raw = json.dumps({
-            "insights": ["background matters"],
-            "confirmed_shortcuts": ["green bg"],
-            "needs_more_testing": ["texture"],
-            "edit_instructions": [
-                {"edit": "Remove bg", "hypothesis": "h", "type": "background_change", "priority": 4},
-            ],
-        })
-        result = analyzer._parse_iterative_analysis(raw, "cat")
-        assert result.insights == ["background matters"]
-        assert result.confirmed_shortcuts == ["green bg"]
-        assert len(result.edit_instructions) == 1
-        assert result.edit_instructions[0].target == "positive"
-
-
-class TestFallbackClassify:
-    def test_contextual_keyword_returns_contextual(self):
-        obj = object.__new__(QwenVLAnalyzer)
-        assert obj._fallback_classify("Remove the background") == "contextual"
-
-    def test_no_keyword_returns_intrinsic(self):
-        obj = object.__new__(QwenVLAnalyzer)
-        assert obj._fallback_classify("Remove ears") == "intrinsic"
-
-    def test_empty_string_returns_intrinsic(self):
-        obj = object.__new__(QwenVLAnalyzer)
-        assert obj._fallback_classify("") == "intrinsic"
-
-    def test_state_keyword_returns_state_dependent(self):
-        obj = object.__new__(QwenVLAnalyzer)
-        assert obj._fallback_classify("Close the mouth completely") == "state_dependent"
-
-    def test_fold_keyword_returns_state_dependent(self):
-        obj = object.__new__(QwenVLAnalyzer)
-        assert obj._fallback_classify("Fold the wings") == "state_dependent"
-
-
 # ============================================================================
 # Full inference tests (require GPU + model)
 # ============================================================================

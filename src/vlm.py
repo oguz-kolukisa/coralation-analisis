@@ -375,34 +375,6 @@ List 5-8 potential shortcut features. Keep descriptions brief (under 30 words ea
 Skip potential_edit_instructions to keep response short.
 """
 
-_CONFUSING_CLASSES_PROMPT = """\
-You are an expert in image classification and model biases.
-
-Target class: **{class_name}**
-
-I need to find classes that a classifier might CONFUSE with "{class_name}".
-These should be classes that:
-1. Share visual features (shape, texture, color)
-2. Appear in similar contexts
-3. Are semantically related
-
-From the following list of available classes, select the {num_classes} MOST LIKELY to be confused with "{class_name}":
-
-Available classes:
-{class_list}
-
-Respond with JSON:
-{{
-  "confusing_classes": ["class1", "class2", ...],
-  "reasoning": {{
-    "class1": "why this class might be confused",
-    "class2": "why this class might be confused"
-  }}
-}}
-
-Select exactly {num_classes} classes that are most likely to cause false positives or misclassifications.
-"""
-
 _ANALYSIS_PROMPT = """\
 You are an expert in computer vision bias analysis and AI image editing.
 
@@ -475,61 +447,6 @@ Respond with JSON:
 Generate {max_hypotheses} diverse edit instructions. Prioritize edits most likely to reveal shortcuts.
 
 IMPORTANT: Be SPECIFIC. Never use "or", "such as", "for example". Each instruction = ONE concrete action.
-"""
-
-_ITERATIVE_REFINEMENT_PROMPT = """\
-You are an expert in computer vision bias analysis. You are iteratively refining hypotheses about model shortcuts.
-
-Target class: **{class_name}**
-
-## Previous Edit Results:
-{previous_results}
-
-## Your Task:
-Based on these results, generate NEW hypotheses to test. Consider:
-
-1. **What worked**: Edits with large confidence changes reveal important features
-2. **What didn't work**: Small changes suggest the feature isn't critical OR the edit wasn't effective
-3. **Patterns**: Are there common themes in successful edits?
-4. **Unexplored areas**: What features haven't been tested yet?
-
-Generate {max_hypotheses} NEW edit instructions that:
-- Build on successful edits (try variations, combinations)
-- Avoid repeating failed approaches
-- Test features not yet explored
-- Try more aggressive/subtle versions of promising edits
-
-### CRITICAL: Be SPECIFIC and DECISIVE
-- NEVER use "or", "such as", "for example", "like" in edit instructions
-- NEVER reference the target class name in edit instructions
-- BAD: "Add {class_name} features" or "make it resemble a {class_name}"
-- GOOD: "Add elongated curved beak with dark brown coloring"
-- Each edit must be ONE concrete, specific action
-- BAD: "Change background to a nature scene like forest or beach"
-- GOOD: "Replace the background with a solid blue color"
-
-For each edit provide:
-- "edit": Clear, specific, single-action instruction (NO alternatives!)
-- "hypothesis": Expected result based on previous findings
-- "type": "feature_removal" | "feature_addition" | "background_change" | "compound"
-- "priority": 1-5 (5 = most promising based on previous results)
-- "rationale": Why this edit is worth trying given previous results
-
-Respond with JSON:
-{{
-  "insights": ["key insight 1 from previous results", "insight 2", ...],
-  "confirmed_shortcuts": ["features confirmed as shortcuts"],
-  "needs_more_testing": ["features that need more investigation"],
-  "edit_instructions": [
-    {{
-      "edit": "...",
-      "hypothesis": "...",
-      "type": "...",
-      "priority": 5,
-      "rationale": "..."
-    }}
-  ]
-}}
 """
 
 _NEGATIVE_ANALYSIS_PROMPT = """\
@@ -741,6 +658,26 @@ class FinalAnalysis:
 
 
 @dataclass
+class FeatureConcept:
+    """A visual concept identified during feature discovery."""
+    name: str              # 1-3 word concept name
+    type: str              # "target" | "negative" | "environmental"
+    source_image: int = 0  # which image it was found in
+    attention: str = ""    # "high" | "medium" | "low" (from Grad-CAM)
+
+
+@dataclass
+class VerdictContext:
+    """Context for VLM verdict judgment."""
+    class_name: str
+    feature_name: str
+    feature_type: str
+    edit_type: str
+    edit_instruction: str
+    is_target: bool
+
+
+@dataclass
 class EditInstruction:
     edit: str
     hypothesis: str
@@ -827,69 +764,225 @@ class QwenVLAnalyzer:
             self.loaded = True
 
     # ------------------------------------------------------------------
-    # Class selection
+    # New Feature Discovery — 3 passes (concept list, no edits)
     # ------------------------------------------------------------------
 
-    def select_confusing_classes(
-        self,
-        target_class: str,
-        available_classes: list[str],
-        num_classes: int = 5,
-    ) -> list[str]:
-        """
-        Use VLM to select classes most likely to be confused with the target.
+    _JSON_INSTRUCTION = (
+        "\n\nIMPORTANT: Respond with ONLY valid JSON. "
+        "No markdown, no explanation, no text before or after the JSON."
+    )
 
-        Args:
-            target_class: The class we're analyzing
-            available_classes: List of all available class names
-            num_classes: How many confusing classes to select
-
-        Returns:
-            List of class names most likely to cause confusion
-        """
-        # Limit the list to avoid token limits (sample evenly)
-        max_classes = 200
-        if len(available_classes) > max_classes:
-            step = len(available_classes) // max_classes
-            sampled_classes = available_classes[::step][:max_classes]
-        else:
-            sampled_classes = available_classes
-
-        # Remove the target class itself
-        sampled_classes = [c for c in sampled_classes if c.lower() != target_class.lower()]
-
-        prompt = _CONFUSING_CLASSES_PROMPT.format(
-            class_name=target_class,
-            num_classes=num_classes,
-            class_list=", ".join(sampled_classes[:100]),  # Further limit for prompt
+    def discover_target_features(
+        self, image: Image.Image, gradcam: Image.Image | None, class_name: str,
+        source_image: int = 0,
+    ) -> list[FeatureConcept]:
+        """Discover what the model focuses on for correct classification."""
+        prompt = (
+            f"Target class: {class_name}\n\n"
+            "I'm showing you an image and the model's attention heatmap "
+            "(red = high focus, blue = low).\n\n"
+            "List every visual CONCEPT the model focuses on. "
+            "Give short names (1-3 words). "
+            "Include body parts, textures, colors, shapes.\n\n"
+            "Example output:\n"
+            '{"features": [{"name": "dorsal fin", "attention": "high"}, '
+            '{"name": "body stripes", "attention": "medium"}, '
+            '{"name": "eye shape", "attention": "low"}]}'
+            + self._JSON_INSTRUCTION
+        )
+        content = [{"type": "image", "image": image}]
+        if gradcam:
+            content.append({"type": "image", "image": gradcam})
+        content.append({"type": "text", "text": prompt})
+        return self._parse_concepts(
+            self._run([{"role": "user", "content": content}], "discover_target_features"),
+            "target", source_image,
         )
 
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    def discover_negative_features(
+        self, image: Image.Image, gradcam: Image.Image | None,
+        class_name: str, true_label: str, confidence: float,
+        source_image: int = 0,
+    ) -> list[FeatureConcept]:
+        """Discover what confuses the model on non-target images."""
+        prompt = (
+            f"Target class: {class_name}\n"
+            f"This image is actually a {true_label}, NOT a {class_name}.\n"
+            f"The model gives it {confidence:.0%} confidence as {class_name}.\n\n"
+            "I'm showing you the image and the model's attention heatmap "
+            f"for {class_name} (red = high focus).\n\n"
+            "What visual concepts cause the model to confuse this "
+            f"{true_label} with {class_name}?\n\n"
+            "Example output:\n"
+            '{"features": [{"name": "similar body shape", "attention": "high"}, '
+            '{"name": "blue water", "attention": "medium"}]}'
+            + self._JSON_INSTRUCTION
+        )
+        content = [{"type": "image", "image": image}]
+        if gradcam:
+            content.append({"type": "image", "image": gradcam})
+        content.append({"type": "text", "text": prompt})
+        return self._parse_concepts(
+            self._run([{"role": "user", "content": content}], "discover_negative_features"),
+            "negative", source_image,
+        )
 
+    def discover_environmental_features(
+        self, image: Image.Image, class_name: str, source_image: int = 0,
+    ) -> list[FeatureConcept]:
+        """Discover environmental/contextual elements not part of the object."""
+        prompt = (
+            f"Target class: {class_name}\n\n"
+            f"List all environmental and contextual elements in this image "
+            f"that are NOT part of the {class_name} itself. "
+            "Include: background, setting, lighting, co-occurring objects, "
+            "surfaces, other animals/people.\n\n"
+            "Example output:\n"
+            '{"features": [{"name": "ocean background"}, '
+            '{"name": "fishing net"}, {"name": "person holding fish"}]}'
+            + self._JSON_INSTRUCTION
+        )
+        content = [
+            {"type": "image", "image": image},
+            {"type": "text", "text": prompt},
+        ]
+        return self._parse_concepts(
+            self._run([{"role": "user", "content": content}], "discover_environmental_features"),
+            "environmental", source_image,
+        )
+
+    def _parse_concepts(self, raw: str, feat_type: str, source_image: int) -> list[FeatureConcept]:
+        """Parse VLM response into FeatureConcept list."""
         try:
-            raw = self._run(messages, method_name="select_confusing_classes")
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                data = json.loads(self._repair_json(json_match.group()))
-                confusing = data.get("confusing_classes", [])
-                # Validate that returned classes are in the available list
-                valid_classes = []
-                available_lower = {c.lower(): c for c in available_classes}
-                for c in confusing:
-                    if c.lower() in available_lower:
-                        valid_classes.append(available_lower[c.lower()])
-                if valid_classes:
-                    logger.debug("VLM selected confusing classes for %s: %s",
-                               target_class, valid_classes)
-                    return valid_classes[:num_classes]
+            items = self._extract_feature_list(raw)
+            return [self._item_to_concept(f, feat_type, source_image) for f in items if f]
         except Exception as e:
-            logger.warning("Failed to get confusing classes from VLM: %s", e)
+            logger.warning("Failed to parse %s features: %s", feat_type, e)
+            return []
 
-        # Fallback: return random classes
-        import random
-        fallback = random.sample(sampled_classes, min(num_classes, len(sampled_classes)))
-        logger.debug("Using random fallback classes: %s", fallback)
-        return fallback
+    def _extract_feature_list(self, raw: str) -> list:
+        """Extract features list from VLM JSON response."""
+        match = re.search(r'\{[\s\S]*?\}', raw)
+        if match:
+            data = json.loads(self._repair_json(match.group()))
+            return data.get("features", [])
+        arr_match = re.search(r'\[[\s\S]*\]', raw)
+        if arr_match:
+            return json.loads(self._repair_json(arr_match.group()))
+        return []
+
+    @staticmethod
+    def _item_to_concept(f, feat_type: str, source_image: int) -> FeatureConcept:
+        """Convert a single item (dict or string) to FeatureConcept."""
+        if isinstance(f, str):
+            return FeatureConcept(name=f, type=feat_type, source_image=source_image)
+        return FeatureConcept(
+            name=f.get("name", str(f)),
+            type=feat_type, source_image=source_image,
+            attention=f.get("attention", ""),
+        )
+
+    # ------------------------------------------------------------------
+    # Edit Generation — one VLM call per feature per edit type
+    # ------------------------------------------------------------------
+
+    _EDIT_TYPE_TEMPLATES = {
+        "feature_removal": "Generate edit instructions to REMOVE \"{feature}\" from this image. Describe how to blend/fill.",
+        "state_change": "Generate edit instructions to CHANGE THE STATE of \"{feature}\" (size, color, pose, open/closed).",
+        "environment_removal": "Generate edit instructions to REMOVE \"{feature}\". Replace with neutral background.",
+        "environment_change": "Generate edit instructions to REPLACE \"{feature}\" with something completely different.",
+        "negative_modify": "Generate edit instructions to MODIFY \"{feature}\" to look more like what a {class_name} has.",
+        "negative_environment_add": "Generate edit instructions to ADD \"{feature}\" to the image.",
+    }
+
+    def generate_edit_for_feature(self, image, class_name, feature_name, edit_type) -> list[str]:
+        """Generate edit instructions for one feature with one edit type."""
+        prompt = self._build_edit_prompt(class_name, feature_name, edit_type)
+        content = [{"type": "image", "image": image}, {"type": "text", "text": prompt}]
+        try:
+            return self._parse_edit_list(self._run([{"role": "user", "content": content}], "generate_edit"))
+        except Exception as e:
+            logger.warning("Failed to generate edit for %s/%s: %s", feature_name, edit_type, e)
+            return []
+
+    def _build_edit_prompt(self, class_name, feature_name, edit_type) -> str:
+        """Build the prompt for edit generation."""
+        template = self._EDIT_TYPE_TEMPLATES.get(edit_type, self._EDIT_TYPE_TEMPLATES["feature_removal"])
+        type_prompt = template.format(feature=feature_name, class_name=class_name)
+        return (
+            f"Target class: {class_name}\n\n{type_prompt}\n\n"
+            f"Rules: NEVER mention \"{class_name}\". Be SPECIFIC. 50-150 chars each.\n\n"
+            "Example: "
+            '{"edits": ["Remove the dorsal fin, blend smoothly with body"]}'
+            + self._JSON_INSTRUCTION
+        )
+
+    def _parse_edit_list(self, raw: str) -> list[str]:
+        """Parse VLM response into list of edit instruction strings."""
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            data = json.loads(self._repair_json(match.group()))
+            edits = data.get("edits", [])
+            if edits:
+                return [str(e) for e in edits if e]
+        arr_match = re.search(r'\[[\s\S]*\]', raw)
+        if arr_match:
+            items = json.loads(self._repair_json(arr_match.group()))
+            if isinstance(items, list):
+                return [str(e) for e in items if e and isinstance(e, str)]
+        return []
+
+    # ------------------------------------------------------------------
+    # Feature Verdict — VLM judges essential vs spurious
+    # ------------------------------------------------------------------
+
+    def judge_verdict(self, original, edited, ctx: VerdictContext, per_model: list[dict]) -> dict:
+        """Judge if a feature is essential, spurious, or state_bias."""
+        prompt = self._build_verdict_prompt(ctx, per_model)
+        content = [
+            {"type": "image", "image": original},
+            {"type": "image", "image": edited},
+            {"type": "text", "text": prompt},
+        ]
+        try:
+            raw = self._run([{"role": "user", "content": content}], "judge_verdict")
+            match = re.search(r'\{[\s\S]*\}', raw)
+            if match:
+                return json.loads(self._repair_json(match.group()))
+        except Exception as e:
+            logger.warning("Failed to judge verdict for %s: %s", ctx.feature_name, e)
+        return self._default_verdict(per_model)
+
+    def _build_verdict_prompt(self, ctx: VerdictContext, per_model: list[dict]) -> str:
+        """Build the verdict judgment prompt."""
+        model_lines = "\n".join(
+            f"  - {m['model_name']}: {m['original_confidence']:.0%} → "
+            f"{m['edited_confidence']:.0%} (delta: {m['delta']:+.0%})"
+            for m in per_model
+        )
+        example = per_model[0]["model_name"] if per_model else "resnet50"
+        return (
+            f"Class: {ctx.class_name}\n"
+            f"Feature: {ctx.feature_name} (discovered as: {ctx.feature_type})\n"
+            f"Edit type: {ctx.edit_type}\n"
+            f"Edit: \"{ctx.edit_instruction}\"\n"
+            f"Image: {'target class (correctly classified)' if ctx.is_target else 'non-target class (different species)'}\n\n"
+            "Original (first) and edited (second) images shown.\n\n"
+            f"Results:\n{model_lines}\n\n"
+            "CLASSIFICATION RULES:\n"
+            "- If a TARGET body part (fin, eye, scale, beak, etc) is removed and confidence DROPS → ESSENTIAL (model correctly uses it)\n"
+            "- If a TARGET body part state is changed and confidence DROPS → STATE_BIAS (model requires specific pose)\n"
+            "- If an ENVIRONMENTAL element (background, water, person, net) is removed and confidence DROPS → SPURIOUS (model relies on context)\n"
+            "- If an edit on a NON-TARGET image INCREASES confidence → SPURIOUS (model is fooled by superficial features)\n\n"
+            "Classify each model: essential | spurious | state_bias\n\n"
+            f'Example: {{"per_model": {{"{example}": {{"verdict": "essential", "reasoning": "body part removal correctly drops confidence"}}}}}}'
+            + self._JSON_INSTRUCTION
+        )
+
+    @staticmethod
+    def _default_verdict(per_model: list[dict]) -> dict:
+        """Return unknown verdict for all models."""
+        return {"per_model": {m["model_name"]: {"verdict": "unknown", "reasoning": ""} for m in per_model}}
 
     # ------------------------------------------------------------------
     # Knowledge-Based Feature Discovery (no image required)
@@ -1315,60 +1408,6 @@ class QwenVLAnalyzer:
             ))
         return result
 
-    def analyze_iterative(
-        self,
-        image: Image.Image,
-        edited_images: list[Image.Image],
-        class_name: str,
-        previous_results: list[dict],
-        max_hypotheses: int = 5,
-    ) -> VLMAnalysis:
-        """
-        Analyze previous edit results and generate refined hypotheses.
-
-        Args:
-            image: Original image
-            edited_images: List of edited images from previous iteration
-            class_name: Target class name
-            previous_results: List of dicts with keys:
-                - edit: str (the edit instruction)
-                - original_confidence: float
-                - edited_confidence: float
-                - delta: float
-                - confirmed: bool
-            max_hypotheses: Number of new hypotheses to generate
-        """
-        # Format previous results for the prompt
-        results_text = []
-        for i, r in enumerate(previous_results):
-            status = "CONFIRMED" if r.get("confirmed") else "not confirmed"
-            delta = r.get("delta", 0)
-            direction = "↓" if delta < 0 else "↑" if delta > 0 else "→"
-            results_text.append(
-                f"{i+1}. \"{r.get('edit', 'N/A')}\"\n"
-                f"   Confidence: {r.get('original_confidence', 0):.1%} {direction} {r.get('edited_confidence', 0):.1%} "
-                f"(Δ = {delta:+.1%}) [{status}]"
-            )
-
-        prompt = _ITERATIVE_REFINEMENT_PROMPT.format(
-            class_name=class_name,
-            previous_results="\n".join(results_text),
-            max_hypotheses=max_hypotheses,
-        )
-
-        # Show original + some edited images for context
-        content = [{"type": "image", "image": image}]
-        # Add up to 4 edited images
-        for img in edited_images[:4]:
-            content.append({"type": "image", "image": img})
-        content.append({"type": "text", "text": prompt})
-
-        messages = [{"role": "user", "content": content}]
-        logger.debug("analyze_iterative: Analyzing %s with %d previous results, %d edited images",
-                    class_name, len(previous_results), len(edited_images))
-        raw = self._run(messages, method_name="analyze_iterative")
-        return self._parse_iterative_analysis(raw, class_name)
-
     # ------------------------------------------------------------------
 
     def _run(self, messages: list[dict], method_name: str = "unknown") -> str:
@@ -1408,12 +1447,12 @@ class QwenVLAnalyzer:
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                   for k, v in inputs.items()}
 
-        logger.debug("VLM generating response (max_new_tokens=2048, temp=0.1)...")
+        logger.debug("VLM generating response (max_new_tokens=8192, temp=0.1)...")
 
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=2048,  # Reduced to save VRAM
+                max_new_tokens=8192,
                 temperature=0.1,
                 do_sample=False,
             )
@@ -1460,40 +1499,6 @@ class QwenVLAnalyzer:
 
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning("Failed to parse VLM response: %s", e)
-
-        return analysis
-
-    def _parse_iterative_analysis(self, raw: str, class_name: str) -> VLMAnalysis:
-        """Extract JSON from iterative refinement response."""
-        analysis = VLMAnalysis(class_name=class_name, raw_response=raw)
-        try:
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if not json_match:
-                logger.warning("No JSON found in VLM iterative response")
-                return analysis
-
-            data: dict[str, Any] = json.loads(self._repair_json(json_match.group()))
-            analysis.insights = data.get("insights", [])
-            analysis.confirmed_shortcuts = data.get("confirmed_shortcuts", [])
-            analysis.needs_more_testing = data.get("needs_more_testing", [])
-
-            # Parse edit instructions
-            instructions = []
-            for i, instr in enumerate(data.get("edit_instructions", [])):
-                instructions.append(EditInstruction(
-                    edit=instr.get("edit", ""),
-                    hypothesis=instr.get("hypothesis", ""),
-                    type=instr.get("type", "feature_removal"),
-                    target="positive",  # Iterative analysis focuses on positive samples
-                    priority=instr.get("priority", 3),
-                    image_index=0,
-                ))
-            analysis.edit_instructions = sorted(
-                instructions, key=lambda x: x.priority, reverse=True
-            )
-
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning("Failed to parse VLM iterative response: %s", e)
 
         return analysis
 
@@ -1641,9 +1646,65 @@ Key distinction:
             self._classify_via_vlm(messages, features)
         except Exception as e:
             logger.warning("Failed to classify features: %s", e)
-            self._classify_via_keywords(features)
+            self._classify_via_fallback(features)
 
         return features
+
+    def name_features(self, class_name: str, edits: list[dict]) -> list[str]:
+        """Use VLM to generate concise feature names for confirmed edits."""
+        if not edits:
+            return []
+        edit_list = "\n".join(
+            f"{i+1}. \"{e.get('instruction', '')}\" (delta: {e.get('mean_delta', 0):+.2f})"
+            for i, e in enumerate(edits)
+        )
+        prompt = f"""\
+Target class: **{class_name}**
+
+These edits were applied to images. For each, give a SHORT concept name (1-3 words)
+that describes the feature being tested. NOT the edit action — the FEATURE itself.
+
+Examples:
+- "Remove the ocean background" → "ocean background"
+- "Close the shark's mouth completely" → "open mouth"
+- "Replace red comb with black" → "red comb color"
+- "Add stripes to the body" → "body stripes"
+
+Edits:
+{edit_list}
+
+Respond with JSON: {{"names": ["name1", "name2", ...]}}
+"""
+        try:
+            raw = self._run(
+                [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+                method_name="name_features",
+            )
+            return self._parse_feature_names(raw, len(edits))
+        except Exception as e:
+            logger.warning("Failed to name features: %s", e)
+            return [""] * len(edits)
+
+    def _parse_feature_names(self, raw: str, expected: int) -> list[str]:
+        """Extract feature names list from VLM response."""
+        names = self._extract_names_list(raw)
+        # Pad with empty strings if VLM returned fewer than expected
+        return (names + [""] * expected)[:expected]
+
+    def _extract_names_list(self, raw: str) -> list[str]:
+        """Parse a names list from VLM JSON response."""
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            data = json.loads(self._repair_json(match.group()))
+            names = data.get("names", [])
+            if names:
+                return [str(n) for n in names]
+        arr_match = re.search(r'\[[\s\S]*\]', raw)
+        if arr_match:
+            parsed = json.loads(self._repair_json(arr_match.group()))
+            if isinstance(parsed, list):
+                return [str(n) for n in parsed]
+        return []
 
     def _classify_via_vlm(self, messages: list, features: list[dict]):
         """Run VLM classification and map results back to features."""
@@ -1664,10 +1725,10 @@ Key distinction:
                 )
                 features[idx]["feature_name"] = c.get("feature_name", "")
 
-    def _classify_via_keywords(self, features: list[dict]):
-        """Apply keyword-based fallback to all features."""
+    def _classify_via_fallback(self, features: list[dict]):
+        """Set unknown type when VLM classification fails entirely."""
         for f in features:
-            f["feature_type"] = self._fallback_classify(f.get("instruction", ""))
+            f["feature_type"] = "unknown"
             f["feature_name"] = ""
 
     def _extract_classifications(self, raw: str) -> list[dict]:
@@ -1703,32 +1764,7 @@ Key distinction:
         return raw
 
     def _fill_unclassified(self, features: list[dict]):
-        """Apply keyword fallback to features the VLM did not classify."""
+        """Mark unclassified features as unknown."""
         for f in features:
             if not f.get("feature_type"):
-                f["feature_type"] = self._fallback_classify(
-                    f.get("instruction", ""),
-                )
-
-    _CONTEXTUAL_KEYWORDS = frozenset([
-        "background", "environment", "lighting", "scene", "setting",
-        "sky", "ground", "floor", "wall", "water", "grass", "snow",
-        "forest", "field", "sand", "ocean", "sea", "landscape",
-        "weather", "shadow", "reflection", "blur", "bokeh",
-        "indoor", "outdoor", "habitat", "surrounding", "context",
-    ])
-
-    _STATE_KEYWORDS = frozenset([
-        "close", "open", "fold", "unfold", "straighten", "bend",
-        "sit", "stand", "crouch", "curl", "stretch", "tuck",
-        "raise", "lower", "retract", "extend", "relax", "tense",
-    ])
-
-    def _fallback_classify(self, instruction: str) -> str:
-        """Keyword-based classification when VLM fails."""
-        lower = instruction.lower()
-        if any(kw in lower for kw in self._CONTEXTUAL_KEYWORDS):
-            return "contextual"
-        if any(kw in lower for kw in self._STATE_KEYWORDS):
-            return "state_dependent"
-        return "intrinsic"
+                f["feature_type"] = "unknown"

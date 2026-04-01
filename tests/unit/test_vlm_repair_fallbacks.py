@@ -47,14 +47,6 @@ class TestParseAnalysisRepairFallback:
         assert len(result.edit_instructions) == 1
 
 
-class TestParseIterativeRepairFallback:
-    def test_malformed_json_repaired(self):
-        a = _make_analyzer()
-        raw = '{"insights": ["bg matters",], "edit_instructions": [{"edit": "test", "hypothesis": "h", "type": "t", "priority": 3,},],}'
-        result = a._parse_iterative_analysis(raw, "cat")
-        assert len(result.edit_instructions) == 1
-
-
 class TestGenerateKnowledgeRepairFallback:
     def test_malformed_json_repaired(self):
         a = _make_analyzer()

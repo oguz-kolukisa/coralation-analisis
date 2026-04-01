@@ -4,7 +4,6 @@ from src.vlm import (
     _KNOWLEDGE_BASED_FEATURES_PROMPT,
     _NEGATIVE_ANALYSIS_PROMPT,
     _ANALYSIS_PROMPT,
-    _ITERATIVE_REFINEMENT_PROMPT,
 )
 
 
@@ -24,7 +23,3 @@ class TestPromptAntiTautology:
     def test_analysis_prompt(self):
         prompt = _ANALYSIS_PROMPT.lower()
         assert "never reference the class name" in prompt
-
-    def test_iterative_prompt(self):
-        prompt = _ITERATIVE_REFINEMENT_PROMPT.lower()
-        assert "never reference" in prompt

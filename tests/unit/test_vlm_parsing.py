@@ -1,6 +1,6 @@
 """Tests for VLM parsing and helper methods (no GPU needed).
 
-Tests _parse_*, _repair_json, _fallback_classify, select_confusing_classes,
+Tests _parse_*, _repair_json, _fallback_classify,
 and other methods that can be tested by mocking _run().
 """
 from __future__ import annotations
@@ -232,29 +232,6 @@ class TestParseAnalysisEdgeCases:
 
 
 # ============================================================================
-# _parse_iterative_analysis — edge cases
-# ============================================================================
-
-class TestParseIterativeEdgeCases:
-    @pytest.fixture
-    def analyzer(self):
-        return _make_analyzer()
-
-    def test_all_targets_are_positive(self, analyzer):
-        raw = json.dumps({
-            "edit_instructions": [
-                {"edit": "a", "hypothesis": "h", "type": "t", "priority": 3},
-            ],
-        })
-        result = analyzer._parse_iterative_analysis(raw, "cat")
-        assert result.edit_instructions[0].target == "positive"
-
-    def test_json_error_returns_empty(self, analyzer):
-        result = analyzer._parse_iterative_analysis("{bad}", "cat")
-        assert result.edit_instructions == []
-
-
-# ============================================================================
 # FeatureDiscovery properties
 # ============================================================================
 
@@ -271,52 +248,6 @@ class TestFeatureDiscoveryProperties:
 # ============================================================================
 # Methods that call _run() — mock _run
 # ============================================================================
-
-class TestSelectConfusingClasses:
-    def test_returns_valid_classes(self):
-        analyzer = _make_analyzer()
-        analyzer._run = MagicMock(return_value=json.dumps({
-            "confusing_classes": ["dog", "wolf"],
-        }))
-        analyzer._repair_json = QwenVLAnalyzer._repair_json.__get__(analyzer)
-
-        result = analyzer.select_confusing_classes(
-            "cat", ["dog", "wolf", "fish", "bird"], num_classes=2
-        )
-        assert result == ["dog", "wolf"]
-
-    def test_filters_invalid_classes(self):
-        analyzer = _make_analyzer()
-        analyzer._run = MagicMock(return_value=json.dumps({
-            "confusing_classes": ["dog", "nonexistent"],
-        }))
-        analyzer._repair_json = QwenVLAnalyzer._repair_json.__get__(analyzer)
-
-        result = analyzer.select_confusing_classes(
-            "cat", ["dog", "wolf"], num_classes=5
-        )
-        assert result == ["dog"]
-
-    def test_fallback_on_failure(self):
-        analyzer = _make_analyzer()
-        analyzer._run = MagicMock(side_effect=Exception("VLM failed"))
-        analyzer._repair_json = QwenVLAnalyzer._repair_json.__get__(analyzer)
-
-        result = analyzer.select_confusing_classes(
-            "cat", ["dog", "wolf", "fish"], num_classes=2
-        )
-        assert len(result) == 2
-        assert all(c in ["dog", "wolf", "fish"] for c in result)
-
-    def test_limits_class_list_for_long_lists(self):
-        analyzer = _make_analyzer()
-        analyzer._run = MagicMock(return_value='{"confusing_classes": ["c_0"]}')
-        analyzer._repair_json = QwenVLAnalyzer._repair_json.__get__(analyzer)
-
-        classes = [f"c_{i}" for i in range(500)]
-        result = analyzer.select_confusing_classes("cat", classes, num_classes=1)
-        assert len(result) <= 1
-
 
 class TestGenerateKnowledgeBasedFeatures:
     def test_returns_features(self):
@@ -457,41 +388,6 @@ class TestAnalyzeNegativeMocked:
         assert result.edit_instructions[0].target == "negative"
 
 
-class TestAnalyzeIterativeMocked:
-    def test_returns_insights(self):
-        analyzer = _make_analyzer()
-        analyzer._run = MagicMock(return_value=json.dumps({
-            "insights": ["bg matters"],
-            "confirmed_shortcuts": ["bg"],
-            "needs_more_testing": ["texture"],
-            "edit_instructions": [
-                {"edit": "Remove bg", "hypothesis": "h", "type": "background_change", "priority": 5},
-            ],
-        }))
-        analyzer._repair_json = QwenVLAnalyzer._repair_json.__get__(analyzer)
-
-        img = Image.new("RGB", (64, 64))
-        edited = [Image.new("RGB", (64, 64))]
-        prev = [{"edit": "test", "original_confidence": 0.9, "edited_confidence": 0.7,
-                 "delta": -0.2, "confirmed": True}]
-        result = analyzer.analyze_iterative(img, edited, "cat", prev)
-        assert result.insights == ["bg matters"]
-
-    def test_limits_edited_images_to_four(self):
-        analyzer = _make_analyzer()
-        analyzer._run = MagicMock(return_value='{"edit_instructions": []}')
-        analyzer._repair_json = QwenVLAnalyzer._repair_json.__get__(analyzer)
-
-        img = Image.new("RGB", (64, 64))
-        edited = [Image.new("RGB", (64, 64)) for _ in range(10)]
-        analyzer.analyze_iterative(img, edited, "cat", [])
-        # Check the messages sent to _run
-        call_args = analyzer._run.call_args[0][0]
-        # Count image items in content
-        image_count = sum(1 for item in call_args[0]["content"] if item.get("type") == "image")
-        assert image_count == 5  # 1 original + 4 edited (capped)
-
-
 class TestVerifyEditMocked:
     def test_returns_parsed_result(self):
         analyzer = _make_analyzer()
@@ -550,12 +446,10 @@ class TestClassifyFeaturesMocked:
         analyzer = _make_analyzer()
         analyzer._run = MagicMock(side_effect=Exception("fail"))
         analyzer._repair_json = QwenVLAnalyzer._repair_json.__get__(analyzer)
-        analyzer._fallback_classify = QwenVLAnalyzer._fallback_classify.__get__(analyzer)
 
         features = [{"instruction": "Remove ears", "hypothesis": "h"}]
         result = analyzer.classify_features("cat", features)
-        # Fallback now uses keyword-based classification
-        assert result[0]["feature_type"] == "intrinsic"
+        assert result[0]["feature_type"] == "unknown"
 
     def test_out_of_range_index_ignored(self):
         analyzer = _make_analyzer()
@@ -568,5 +462,5 @@ class TestClassifyFeaturesMocked:
 
         features = [{"instruction": "test", "hypothesis": "h"}]
         result = analyzer.classify_features("cat", features)
-        # Index 99 is out of range; _fill_unclassified applies keyword fallback
-        assert result[0]["feature_type"] == "intrinsic"
+        # Index 99 is out of range; _fill_unclassified sets unknown
+        assert result[0]["feature_type"] == "unknown"

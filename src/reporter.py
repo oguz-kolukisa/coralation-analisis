@@ -12,6 +12,9 @@ from pathlib import Path
 
 import numpy as np
 from jinja2 import Template
+from datetime import datetime, timezone
+
+from .__version__ import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +221,7 @@ document.addEventListener('DOMContentLoaded', function() {
 </head>
 <body>
 <h1>Classification Model Bias Analysis Report</h1>
+<p style="color: #666; margin-top: -10px;">v{{ version }} — {{ generated_at }}</p>
 
 <!-- Tab Navigation -->
 <div class="tab-nav">
@@ -1344,7 +1348,7 @@ document.addEventListener('DOMContentLoaded', function() {
 </html>
 """
 
-_MD_TEMPLATE = """# Classification Model Bias Analysis Report
+_MD_TEMPLATE = """# Classification Model Bias Analysis Report (v{{ version }} — {{ generated_at }})
 
 **Model**: {{ config.classifier_model if config else 'ResNet-50 (ImageNet-1k)' }} | **Dataset**: {{ config.hf_dataset if config else 'ILSVRC/imagenet-1k' }} ({{ config.hf_dataset_split if config else 'validation' }}) | **Classes analyzed**: {{ results|length }}
 
@@ -1506,6 +1510,7 @@ tr:hover { background: #f1f3f5; }
 <body>
 <div class="container">
 <h1>Cross-Model Comparison Report</h1>
+<p style="color: #666;">v{{ version }} — {{ generated_at }}</p>
 <p><strong>Models:</strong> {{ models|join(", ") }} | <strong>Classes:</strong> {{ comparison.per_class|length }}</p>
 
 <h2>Model Summary</h2>
@@ -1590,7 +1595,7 @@ tr:hover { background: #f1f3f5; }
 """
 
 _COMPARISON_MD_TEMPLATE = """\
-# Cross-Model Comparison Report
+# Cross-Model Comparison Report (v{{ version }} — {{ generated_at }})
 
 **Models:** {{ models|join(", ") }} | **Classes:** {{ comparison.per_class|length }}
 
@@ -1717,7 +1722,11 @@ class Reporter:
         path = self.output_dir / f"{self.prefix}report.html"
         # Use relative paths for HTML (so report is portable)
         relative_results = self._convert_paths_to_relative(results)
-        html = Template(_HTML_TEMPLATE).render(results=relative_results, config=self.config)
+        html = Template(_HTML_TEMPLATE).render(
+            results=relative_results, config=self.config,
+            version=__version__,
+            generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        )
         path.write_text(html, encoding="utf-8")
         logger.info("Saved HTML report: %s", path)
         return path
@@ -1726,7 +1735,11 @@ class Reporter:
         path = self.output_dir / f"{self.prefix}report.md"
         # Use relative paths for Markdown too
         relative_results = self._convert_paths_to_relative(results)
-        md = Template(_MD_TEMPLATE).render(results=relative_results, config=self.config)
+        md = Template(_MD_TEMPLATE).render(
+            results=relative_results, config=self.config,
+            version=__version__,
+            generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        )
         path.write_text(md, encoding="utf-8")
         logger.info("Saved Markdown report: %s", path)
         return path
@@ -1753,13 +1766,16 @@ class Reporter:
         comparison = self._build_comparison_data(all_model_dicts, model_names)
         json_path.write_text(json.dumps(comparison, indent=2, default=str))
 
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         html = Template(_COMPARISON_HTML_TEMPLATE).render(
             models=model_names, comparison=comparison, config=self.config,
+            version=__version__, generated_at=now,
         )
         html_path.write_text(html, encoding="utf-8")
 
         md = Template(_COMPARISON_MD_TEMPLATE).render(
             models=model_names, comparison=comparison, config=self.config,
+            version=__version__, generated_at=now,
         )
         md_path.write_text(md, encoding="utf-8")
 
@@ -1828,7 +1844,7 @@ class Reporter:
         for e in class_dict.get("confirmed_hypotheses", []):
             if self._is_spurious(e):
                 spurious += 1
-                feat = e.get("feature_name") or e.get("instruction", "")[:25]
+                feat = e.get("feature_name") or e.get("hypothesis", "unknown feature")
                 if feat not in spurious_features:
                     spurious_features.append(feat)
         risk = class_dict.get("summary", {}).get("risk_level", "MEDIUM")
@@ -1843,42 +1859,14 @@ class Reporter:
     def _is_spurious(e: dict) -> bool:
         """Check if an edit result is a spurious shortcut."""
         feat_type = e.get("feature_type", "")
-        edit_type = e.get("edit_type", "")
         delta = e.get("mean_delta", 0)
         target = e.get("target_type", "")
-        is_contextual = (
-            feat_type == "contextual"
-            or (not feat_type and edit_type in (
-                "context_addition", "context_removal", "background_change",
-            ))
-        )
-        # Override: if VLM said contextual but instruction removes a body part,
-        # it's a VLM error — body parts are intrinsic
-        if is_contextual and Reporter._instruction_removes_body_part(e):
-            is_contextual = False
+        if feat_type == "unknown":
+            return False
+        is_contextual = feat_type == "contextual"
         is_state = feat_type == "state_dependent"
-        # Removing context drops confidence = shortcut
         is_ctx_drop = is_contextual and target == "positive" and delta < -0.05
-        # Adding/enhancing context boosts confidence = spurious
         is_ctx_boost = is_contextual and target == "positive" and delta > 0.10
-        # State change drops confidence = pose/state bias
         is_state_drop = is_state and target == "positive" and delta < -0.05
-        # Negative image fooled by adding class features
         is_neg = target == "negative" and delta > 0.05
         return is_ctx_drop or is_ctx_boost or is_state_drop or is_neg
-
-    _BODY_PART_KEYWORDS = frozenset([
-        "fin", "fins", "dorsal", "beak", "comb", "wattle", "combs", "wattles",
-        "eye", "eyes", "tail", "wing", "wings", "feather", "feathers",
-        "snout", "teeth", "tooth", "jaw", "mouth", "ear", "ears",
-        "leg", "legs", "claw", "claws", "horn", "horns", "scale", "scales",
-        "paw", "paws", "mane", "whisker", "whiskers", "antenna", "antennae",
-    ])
-
-    @staticmethod
-    def _instruction_removes_body_part(e: dict) -> bool:
-        """Check if an instruction removes an intrinsic body part."""
-        instr = e.get("instruction", "").lower()
-        if "remove" not in instr:
-            return False
-        return any(kw in instr for kw in Reporter._BODY_PART_KEYWORDS)
