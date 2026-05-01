@@ -223,6 +223,20 @@ class ImageEditor:
                     self.pipe.set_progress_bar_config(disable=True)
             self.loaded = True
 
+    @staticmethod
+    def _snap_dims(w: int, h: int) -> tuple[int, int]:
+        """Snap dims to multiples of 8 within [_MIN_DIMENSION, _MAX_DIMENSION]."""
+        scale = min(_MAX_DIMENSION / max(w, h), 1.0)  # don't upscale
+        new_w = max(int(w * scale) // 8 * 8, 256)
+        new_h = max(int(h * scale) // 8 * 8, 256)
+        return new_w, new_h
+
+    def _make_generator(self, seed: int):
+        """Create a torch.Generator on the correct device for the backend."""
+        import torch
+        gen_device = "cpu" if (self._is_qwen and self._use_fp8_offload) else self.device
+        return torch.Generator(device=gen_device).manual_seed(seed)
+
     def edit(self, image: Image.Image, instruction: str,
              image_guidance_scale: float = _IMAGE_GUIDANCE,
              text_guidance_scale: float = _TEXT_GUIDANCE,
@@ -247,23 +261,13 @@ class ImageEditor:
         original_size = image.size
         img = image.convert("RGB")
 
-        # Resize preserving aspect ratio, with max dimension = _MAX_DIMENSION
-        # and ensure dimensions are divisible by 8 (required by diffusion model)
-        w, h = img.size
-        scale = min(_MAX_DIMENSION / max(w, h), 1.0)  # don't upscale
-        new_w = int(w * scale) // 8 * 8
-        new_h = int(h * scale) // 8 * 8
-        new_w = max(new_w, 256)  # minimum size
-        new_h = max(new_h, 256)
-
+        new_w, new_h = self._snap_dims(*img.size)
         img = img.resize((new_w, new_h), Image.LANCZOS)
 
         # Append constraint to keep other parts unchanged
         full_prompt = f"{instruction}. Keep everything else unchanged."
 
-        # Use CPU generator when using FP8 offload (model moves between CPU/GPU)
-        gen_device = "cpu" if (self._is_qwen and self._use_fp8_offload) else self.device
-        generator = torch.Generator(device=gen_device).manual_seed(seed)
+        generator = self._make_generator(seed)
 
         # Determine actual steps based on model
         actual_steps = _FLUX_STEPS if self._is_flux else num_steps
@@ -314,5 +318,39 @@ class ImageEditor:
             raise
         except Exception as e:
             logger.error("Image editing failed: %s (instruction: %s)", e, instruction[:50])
+            logger.error("Full traceback:", exc_info=True)
+            raise
+
+    def generate_from_text(self, prompt: str, seed: int = 42,
+                            size: tuple[int, int] = (768, 768)) -> Image.Image:
+        """Text-to-image via the FLUX pipe (image=None). Same 4-step config as edit()."""
+        if not self._is_flux:
+            raise NotImplementedError(
+                "generate_from_text requires the FLUX backend; got "
+                f"{self._model_name}"
+            )
+        import torch
+
+        new_w, new_h = self._snap_dims(*size)
+        generator = self._make_generator(seed)
+        logger.debug("Editor.generate_from_text: prompt='%s', seed=%d, size=%dx%d, steps=%d",
+                     prompt[:60], seed, new_w, new_h, _FLUX_STEPS)
+        try:
+            with torch.inference_mode():
+                result = self.pipe(
+                    prompt=prompt,
+                    image=None,
+                    num_inference_steps=_FLUX_STEPS,
+                    generator=generator,
+                    height=new_h,
+                    width=new_w,
+                )
+            return result.images[0]
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error("CUDA OOM during text-to-image: %s", e)
+            torch.cuda.empty_cache()
+            raise
+        except Exception as e:
+            logger.error("Text-to-image failed: %s (prompt: %s)", e, prompt[:50])
             logger.error("Full traceback:", exc_info=True)
             raise

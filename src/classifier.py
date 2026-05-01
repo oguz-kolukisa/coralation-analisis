@@ -67,8 +67,31 @@ _MODEL_REGISTRY: dict[str, dict] = {
 
 
 def available_classifiers() -> list[str]:
-    """Return names of all supported classifier models."""
-    return list(_MODEL_REGISTRY.keys())
+    """Return names of all supported classifiers (ImageNet + CLIP + HF)."""
+    from .clip_classifier import available_clip_classifiers
+    from .hf_classifier import available_hf_classifiers
+    return (
+        list(_MODEL_REGISTRY.keys())
+        + available_clip_classifiers()
+        + available_hf_classifiers()
+    )
+
+
+def build_classifier(
+    name: str, device: str = "cuda", attention_method: str = "gradcam++",
+    label_lookup=None,
+):
+    """Factory: return the correct classifier for a given model name."""
+    from .clip_classifier import CLIPClassifier, is_clip_model
+    from .hf_classifier import HFClassifier, is_hf_classifier
+    if is_clip_model(name):
+        return CLIPClassifier(model_name=name, device=device,
+                               label_lookup=label_lookup)
+    if is_hf_classifier(name):
+        return HFClassifier(model_name=name, device=device)
+    return ImageNetClassifier(
+        model_name=name, device=device, attention_method=attention_method,
+    )
 
 
 class ClassifierResult(NamedTuple):

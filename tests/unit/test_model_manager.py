@@ -42,32 +42,46 @@ class TestInit:
 # =========================================================================
 
 class TestLazyLoading:
-    @patch("src.model_manager.ImageNetClassifier")
+    @patch("src.model_manager.build_classifier")
     @patch("src.model_manager.torch")
-    def test_classifier_loads_on_first_call(self, mock_torch, MockClassifier, config_high_vram):
+    def test_classifier_loads_on_first_call(self, mock_torch, mock_build, config_high_vram):
         mm = ModelManager(config_high_vram)
         result = mm.classifier()
-        MockClassifier.assert_called_once()
+        mock_build.assert_called_once()
         assert result is mm._classifiers["resnet50"]
 
-    @patch("src.model_manager.ImageNetClassifier")
+    @patch("src.model_manager.build_classifier")
     @patch("src.model_manager.torch")
-    def test_classifier_reuses_on_second_call(self, mock_torch, MockClassifier, config_high_vram):
+    def test_classifier_reuses_on_second_call(self, mock_torch, mock_build, config_high_vram):
         mm = ModelManager(config_high_vram)
         first = mm.classifier()
         second = mm.classifier()
-        assert MockClassifier.call_count == 1
+        assert mock_build.call_count == 1
         assert first is second
 
-    @patch("src.model_manager.ImageNetClassifier")
+    @patch("src.model_manager.build_classifier")
     @patch("src.model_manager.torch")
-    def test_classifier_by_name(self, mock_torch, MockClassifier, config_high_vram):
+    def test_classifier_by_name(self, mock_torch, mock_build, config_high_vram):
         mm = ModelManager(config_high_vram)
         result = mm.classifier("resnet50")
-        MockClassifier.assert_called_once_with(
-            model_name="resnet50", device="cpu", attention_method="scorecam",
+        mock_build.assert_called_once_with(
+            name="resnet50", device="cpu", attention_method="scorecam",
+            label_lookup=None,
         )
         assert result is mm._classifiers["resnet50"]
+
+    @patch("src.model_manager.build_classifier")
+    @patch("src.model_manager.torch")
+    def test_classifier_routes_clip_name_through_factory(
+        self, mock_torch, mock_build, config_high_vram,
+    ):
+        """CLIP model names should also flow through the factory."""
+        mm = ModelManager(config_high_vram)
+        mm.classifier("clip_vitb32")
+        mock_build.assert_called_once_with(
+            name="clip_vitb32", device="cpu", attention_method="scorecam",
+            label_lookup=None,
+        )
 
     @patch("src.model_manager.QwenVLAnalyzer")
     @patch("src.model_manager.torch")

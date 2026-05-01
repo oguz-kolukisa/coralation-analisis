@@ -49,6 +49,7 @@ class Config(BaseModel):
     editor_model: str = "black-forest-labs/FLUX.2-klein-9b-kv"  # Fast, high-quality (4 steps)
 
     # --- Dataset settings ---
+    dataset: str = "imagenet"           # one of {"imagenet", "cub"} — preset for the fields below
     hf_dataset: str = "ILSVRC/imagenet-1k"
     hf_dataset_split: str = "validation"
     class_source: str = "json"          # "json" = read from file, "dataset" = query dataset labels
@@ -95,9 +96,17 @@ class Config(BaseModel):
 
     verify_edits: bool = False                  # VLM edit verification disabled by default (slower, often unnecessary)
 
+    # --- Probe pipeline (phases 7, 8, 9) ---
+    skip_probes: bool = False                   # if True, skip probe generation + evaluation
+    probe_n_per_variant: int | None = None      # None → auto: ceil(sqrt(k_bias_features)) per class
+    probe_feature_source: str = "any"           # "any" (union — at least one model) or "strict" (intersection)
+    probe_mode: str = "round_robin"             # how bias features are distributed across prompts
+                                                # {"round_robin", "vlm_discretion"}
+
     # --- Paths ---
     output_dir: Path = Path("output")
     resume: bool = True                 # resume from checkpoint if available
+    batch_size: int = 0                 # process classes in batches (0 = all at once)
 
     # --- Runtime ---
     device: str = "cuda"
@@ -129,10 +138,51 @@ class Config(BaseModel):
         return self.checkpoints_dir / model_name
 
     @property
+    def probes_dir(self) -> Path:
+        """Directory for generated probe images + manifest."""
+        return self.output_dir / "probes"
+
+    @property
+    def probe_report_path(self) -> Path:
+        """Where the probe evaluation JSON lives."""
+        return self.reports_dir / "probe_evaluation.json"
+
+    @property
+    def feature_catalog_path(self) -> Path:
+        """Where the per-class feature catalog JSON lives."""
+        return self.reports_dir / "feature_catalog.json"
+
+    @property
     def is_multi_model(self) -> bool:
         """Whether multiple classifiers are configured."""
         return len(self.classifier_models) > 1
 
 
+_DATASET_PRESETS: dict[str, dict] = {
+    "imagenet": {
+        "hf_dataset": "ILSVRC/imagenet-1k",
+        "hf_dataset_split": "validation",
+        "class_source": "json",
+    },
+    "cub": {
+        "hf_dataset": "bentrevett/caltech-ucsd-birds-200-2011",
+        "hf_dataset_split": "test",
+        "class_source": "dataset",
+    },
+}
+
+
+def apply_dataset_preset(overrides: dict) -> dict:
+    """Merge preset values for the chosen dataset into user overrides.
+
+    User-supplied keys always win; the preset only fills unset fields.
+    """
+    dataset = overrides.get("dataset", "imagenet")
+    preset = _DATASET_PRESETS.get(dataset, {})
+    merged = dict(preset)
+    merged.update(overrides)
+    return merged
+
+
 def get_config(**overrides) -> Config:
-    return Config(**overrides)
+    return Config(**apply_dataset_preset(overrides))

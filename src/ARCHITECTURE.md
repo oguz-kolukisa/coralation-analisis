@@ -51,13 +51,83 @@ Coralation is an automated, **domain-agnostic** bias/shortcut discovery tool for
        - Statistical validation (t-test, Cohen's d)
        - Determines if change is statistically & practically significant
 
-7. Report Generation
-   └── reporter.py (Reporter)
-       - Generates HTML/Markdown/JSON reports
-       - Tabbed interface: Overview, Feature Analysis, Class Details, Methodology
-       - Shows shortcut evidence with images
-       - Includes pipeline configuration
+7. Feature Catalog (NEW — phase 7 of PipelineV2)
+   └── feature_extractor.py (extract_catalog)
+       - Aggregates per-class real / biased features per classifier model
+       - Computes strict (intersection) and any (union) cross-model consensus
+       - Writes output/reports/feature_catalog.json (always, even with --no-probes)
+
+8. Probe Generation (NEW — phase 8 of PipelineV2; --no-probes skips)
+   └── probe_generator.py (generate_probes)
+       - VLM writes 4 prompt variants per class:
+           bias_heavy / bias_stripped / real_feature_only / adversarial
+       - Adversarial variant is crafted to TRICK the classifier (target with
+         cues of confusing classes + biased context + unusual pose)
+       - Default mode "round_robin": bias features partitioned into N groups
+         so every feature appears in at least one probe
+       - Auto N = ceil(sqrt(k_bias_features)) per class (override: --probe-samples)
+       - FLUX.2-klein-9b-kv generates probe images from text only
+         (image=None, 4 steps, bfloat16, deterministic seeds)
+       - Writes output/probes/<class_slug>/<variant>_<i>.jpg + manifest.json
+
+9. Probe Evaluation (NEW — phase 9 of PipelineV2; --no-probes skips)
+   └── probe_evaluator.py (evaluate_probes)
+       - Runs every classifier on every probe image
+       - Reports per model: top1_accuracy_overall, top1_accuracy_bias_heavy,
+         top1_accuracy_bias_stripped, top1_accuracy_adversarial, bias_lift_score
+       - Writes output/reports/probe_evaluation.json and probe_report.html
+
+10. Report Generation
+    └── reporter.py (Reporter)
+        - Generates HTML/Markdown/JSON reports
+        - Tabbed interface: Overview, Feature Analysis, Class Details, Methodology
+        - Shows shortcut evidence with images
+        - Includes pipeline configuration
 ```
+
+### Probe Pipeline (phases 7–9)
+
+The probe pipeline turns the bias verdicts from phases 1–6 into a fresh,
+synthetic dataset and a per-model robustness report:
+
+- `src/feature_extractor.py` — `extract_catalog(analysis_dict) -> catalog_dict`. The catalog holds per-class `bias_spurious_strict/_any`, `real_strict/_any`, `bias_state_strict/_any`, plus the `confusing_classes` collected in phase 1.
+- `src/probe_generator.py` — `generate_probes(catalog, output_dir, ProbeConfig, models) -> ProbeManifest`. Two-phase: (1) VLM writes all prompt sets, (2) FLUX renders every prompt once.
+- `src/probe_evaluator.py` — `evaluate_probes(manifest, classifier_names, models) -> dict[name -> ModelMetrics]`. Per-image failures are logged and skipped (one bad classifier call does not kill the whole phase).
+- `src/probe_reporter.py` — `write_probe_report(manifest_path, evaluation_path, output_path)`. Emits a standalone HTML page with a ranked model table, per-class image grids (4 rows × N columns), and per-class × per-model metric tables.
+
+Each module is also runnable as a standalone CLI for re-running a single
+phase against an existing checkpoint:
+
+- `python -m src.feature_extractor --input ... --output ...`
+- `python -m src.probe_generator --catalog ... --output ...`
+- `python -m src.probe_evaluator --manifest ... --models ... --output ...`
+- `python -m src.probe_reporter --manifest ... --evaluation ... --output ...`
+
+#### Probe variants (phase 8)
+
+For each class the VLM emits `N` prompts in each of four variants:
+
+| Variant | Uses | Role |
+|---|---|---|
+| `bias_heavy` | target class + biased context | baseline bias-sensitivity probe |
+| `bias_stripped` | biased context only, class absent | false-positive probe (HIGH accuracy = bias-reliant model) |
+| `real_feature_only` | target class + real features, plain background | clean-baseline confidence probe |
+| `adversarial` | target class + confusing-class cues + biased context + unusual pose | trick probe (LOW accuracy = model fooled) |
+
+#### Feature partitioning (round-robin)
+
+To guarantee that every discovered biased feature reaches the probe set, bias features are partitioned into `N` round-robin groups and the VLM is told which group to use per prompt (prompt *i* → group *i*). The partition is recorded in the manifest per class (`bias_feature_groups` field). `--probe-mode vlm_discretion` disables the partition and reverts to the older "list all features, VLM chooses" behaviour.
+
+#### Auto N per class
+
+`N = ceil(sqrt(k))` where `k` is the number of biased features for that class, floored at 1. Keeps probe count balanced across classes with wildly different feature counts. Override with `--probe-samples N` (explicit integer applied uniformly).
+
+#### CLI flags on `main.py`
+
+- `--no-probes` — skip phases 8 and 9 (phase 7 still runs).
+- `--probe-samples N` — explicit N per class (default: auto `ceil(sqrt(k))`).
+- `--probe-mode {round_robin,vlm_discretion}` — feature distribution strategy (default: round_robin).
+- `--probe-feature-source {strict,any}` — which consensus tier drives the prompts. Default **`any`** (union — at least one classifier flagged the feature as spurious). `strict` requires all classifiers to agree; useful when you want only high-confidence biases.
 
 ## Module Responsibilities
 

@@ -704,34 +704,112 @@ class VLMAnalysis:
     needs_more_testing: list[str] = field(default_factory=list)
 
 
+def _clean_prompt_list(raw, n: int) -> list[str]:
+    """Coerce any iterable of prompt strings to a trimmed list of length ≤ n."""
+    if not isinstance(raw, list):
+        return []
+    cleaned = [str(p).strip() for p in raw if isinstance(p, str) and p.strip()]
+    return cleaned[:n]
+
+
+@dataclass
+class ProbeFeatures:
+    """Features used to build a class's probe prompt set."""
+    class_name: str
+    bias_features: list[str] = field(default_factory=list)
+    real_features: list[str] = field(default_factory=list)
+    confusing_classes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProbePromptSet:
+    """Per-class prompt quartet for probe image generation."""
+    class_name: str
+    bias_heavy: list[str] = field(default_factory=list)
+    bias_stripped: list[str] = field(default_factory=list)
+    real_feature_only: list[str] = field(default_factory=list)
+    adversarial: list[str] = field(default_factory=list)
+
+
 class QwenVLAnalyzer:
-    """Loads Qwen2.5-VL-7B-Instruct and provides analysis methods."""
+    """Vision-language model wrapper. Supports Qwen2.5-VL and Gemma 4 backends.
+
+    All prompt-building and JSON-parsing methods are model-agnostic.
+    Only ``__init__`` and ``_run`` differ between backends.
+    """
 
     def __init__(self, model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
                  device: str = "cuda", dtype: str = "bfloat16"):
         import torch
-        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
         import transformers
         import logging as _logging
 
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.torch_dtype = getattr(torch, dtype)
         self.model_name = model_name
+        self._is_gemma = "gemma" in model_name.lower()
+        self._is_qwen35 = "qwen3.5" in model_name.lower()
+        self._is_qwen3vl = ("qwen3" in model_name.lower()
+                             and "vl" in model_name.lower()
+                             and not self._is_qwen35)
 
-        # Suppress all loading output
         transformers.logging.set_verbosity_error()
         _logging.getLogger("transformers").setLevel(_logging.ERROR)
 
         logger.debug("Loading VLM: %s on %s", model_name, self.device)
-        with suppress_output():
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_name,
-                torch_dtype=self.torch_dtype,
-            ).to(self.device)
-            self.processor = AutoProcessor.from_pretrained(model_name)
+        if self._is_gemma:
+            self._load_gemma(model_name)
+        elif self._is_qwen35:
+            self._load_qwen35(model_name)
+        elif self._is_qwen3vl:
+            self._load_qwen3vl(model_name)
+        else:
+            self._load_qwen(model_name)
         self.model.eval()
         self.loaded = True
         logger.debug("VLM loaded")
+
+    def _load_qwen(self, model_name: str) -> None:
+        """Load Qwen2.5-VL backend."""
+        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+        with suppress_output():
+            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_name, torch_dtype=self.torch_dtype,
+            ).to(self.device)
+            self.processor = AutoProcessor.from_pretrained(model_name)
+
+    def _load_qwen35(self, model_name: str) -> None:
+        """Load Qwen3.5 (vision built in via early fusion).
+
+        Uses ``Qwen3_5ForConditionalGeneration`` — NOT AutoModelForCausalLM,
+        which silently ignores pixel_values / image_grid_thw in generate().
+        """
+        from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
+        with suppress_output():
+            self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
+                model_name, torch_dtype=self.torch_dtype,
+            ).to(self.device)
+            self.processor = AutoProcessor.from_pretrained(model_name)
+
+    def _load_qwen3vl(self, model_name: str) -> None:
+        """Load Qwen3-VL backend — dedicated vision-language model."""
+        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+        with suppress_output():
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name, torch_dtype=self.torch_dtype,
+            ).to(self.device)
+            self.processor = AutoProcessor.from_pretrained(model_name)
+
+    def _load_gemma(self, model_name: str) -> None:
+        """Load Gemma 4 multimodal backend."""
+        from transformers import AutoModelForMultimodalLM, AutoProcessor
+        with suppress_output():
+            self.model = AutoModelForMultimodalLM.from_pretrained(
+                model_name,
+                torch_dtype=self.torch_dtype,
+                ignore_mismatched_sizes=True,
+            ).to(self.device)
+            self.processor = AutoProcessor.from_pretrained(model_name)
 
     def offload(self):
         """Free VRAM by deleting the model."""
@@ -748,18 +826,18 @@ class QwenVLAnalyzer:
     def load_to_gpu(self):
         """Reload model to GPU if it was offloaded."""
         if not self.loaded:
-            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
             import transformers
             import logging as _logging
             transformers.logging.set_verbosity_error()
             _logging.getLogger("transformers").setLevel(_logging.ERROR)
-
-            with suppress_output():
-                self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    self.model_name,
-                    torch_dtype=self.torch_dtype,
-                ).to(self.device)
-            self.processor = AutoProcessor.from_pretrained(self.model_name)
+            if self._is_gemma:
+                self._load_gemma(self.model_name)
+            elif self._is_qwen35:
+                self._load_qwen35(self.model_name)
+            elif self._is_qwen3vl:
+                self._load_qwen3vl(self.model_name)
+            else:
+                self._load_qwen(self.model_name)
             self.model.eval()
             self.loaded = True
 
@@ -931,6 +1009,108 @@ class QwenVLAnalyzer:
             if isinstance(items, list):
                 return [str(e) for e in items if e and isinstance(e, str)]
         return []
+
+    # ------------------------------------------------------------------
+    # Probe prompts — VLM writes text-to-image prompts for bias probing
+    # ------------------------------------------------------------------
+
+    def generate_probe_prompts(self, features: ProbeFeatures,
+                                n_per_variant: int = 3,
+                                mode: str = "vlm_discretion",
+                                bias_groups: list[list[str]] | None = None,
+                                ) -> ProbePromptSet:
+        """Produce four-variant prompt set for probe image generation."""
+        prompt = self._build_probe_prompt(
+            features, n_per_variant, mode=mode, bias_groups=bias_groups,
+        )
+        content = [{"type": "text", "text": prompt}]
+        try:
+            raw = self._run([{"role": "user", "content": content}],
+                             "generate_probe_prompts")
+        except Exception as e:
+            logger.warning("Probe prompt VLM call failed for %s: %s",
+                           features.class_name, e)
+            return self._fallback_prompt_set(features.class_name, n_per_variant)
+        return self._parse_probe_prompts(raw, n_per_variant, features.class_name)
+
+    def _build_probe_prompt(self, features: ProbeFeatures, n: int,
+                              mode: str = "vlm_discretion",
+                              bias_groups: list[list[str]] | None = None) -> str:
+        """Build the VLM prompt for probe prompt generation."""
+        bias_section = self._format_bias_section(
+            features.bias_features, n, mode, bias_groups,
+        )
+        real_list = ", ".join(features.real_features) or "(none confirmed)"
+        confusing_list = (
+            ", ".join(features.confusing_classes) or "(none known)"
+        )
+        return (
+            f"Target class: {features.class_name}\n\n"
+            f"{bias_section}"
+            f"Intrinsic/real features of the class: {real_list}\n"
+            f"Classes the model confuses with {features.class_name}: {confusing_list}\n\n"
+            f"Write {n} text-to-image prompts in EACH of FOUR variants:\n"
+            f"  bias_heavy: the {features.class_name} surrounded by its biased context cues.\n"
+            f"  bias_stripped: ONLY the biased context, WITHOUT a {features.class_name} visible. "
+            f"Do NOT use the word '{features.class_name}' in these prompts.\n"
+            f"  real_feature_only: the {features.class_name} on a plain background showing only its real features.\n"
+            f"  adversarial: an image DESIGNED TO TRICK the classifier — a {features.class_name} shown with visual features shared with the confusing classes above, "
+            f"under an unusual pose or angle or lighting, on the biased context background. Goal: the classifier should struggle or misclassify this image.\n\n"
+            "Each prompt 50-220 chars, photographic style, ONE concrete scene per prompt. "
+            "No 'or', 'such as', 'for example'.\n\n"
+            "Output JSON:\n"
+            '{"bias_heavy": [...], "bias_stripped": [...], "real_feature_only": [...], "adversarial": [...]}'
+            + self._JSON_INSTRUCTION
+        )
+
+    def _format_bias_section(self, bias_features: list[str], n: int, mode: str,
+                               bias_groups: list[list[str]] | None) -> str:
+        """Emit the biased-context block — grouped for round_robin, flat otherwise."""
+        if not bias_features:
+            return "Biased context the classifier relies on: (none discovered)\n"
+        if mode != "round_robin" or not bias_groups:
+            return (
+                "Biased context the classifier relies on: "
+                f"{', '.join(bias_features)}\n"
+            )
+        lines = [
+            "Biased context split into feature groups — for bias_heavy and "
+            f"bias_stripped, each of the {n} prompts MUST use a DIFFERENT group "
+            "(prompt i uses group i):",
+        ]
+        for i, g in enumerate(bias_groups):
+            lines.append(f"  Group {i}: {', '.join(g) if g else '(empty)'}")
+        return "\n".join(lines) + "\n"
+
+    def _parse_probe_prompts(self, raw: str, n: int,
+                              class_name: str) -> ProbePromptSet:
+        """Parse VLM JSON into ProbePromptSet; fall back on any failure."""
+        try:
+            match = re.search(r'\{[\s\S]*\}', raw)
+            if not match:
+                raise ValueError("no JSON object in response")
+            data = json.loads(self._repair_json(match.group()))
+            return ProbePromptSet(
+                class_name=class_name,
+                bias_heavy=_clean_prompt_list(data.get("bias_heavy"), n),
+                bias_stripped=_clean_prompt_list(data.get("bias_stripped"), n),
+                real_feature_only=_clean_prompt_list(data.get("real_feature_only"), n),
+                adversarial=_clean_prompt_list(data.get("adversarial"), n),
+            )
+        except Exception as e:
+            logger.warning("Probe prompt parse failed for %s: %s", class_name, e)
+            return self._fallback_prompt_set(class_name, n)
+
+    def _fallback_prompt_set(self, class_name: str, n: int) -> ProbePromptSet:
+        """Deterministic fallback so downstream probes never crash."""
+        base = f"A photograph of a {class_name}"
+        return ProbePromptSet(
+            class_name=class_name,
+            bias_heavy=[f"{base} in its typical environment"] * n,
+            bias_stripped=["A photograph of an empty environment"] * n,
+            real_feature_only=[f"{base} on a plain white studio background"] * n,
+            adversarial=[f"{base} in unusual lighting and pose"] * n,
+        )
 
     # ------------------------------------------------------------------
     # Feature Verdict — VLM judges essential vs spurious
@@ -1411,10 +1591,19 @@ class QwenVLAnalyzer:
     # ------------------------------------------------------------------
 
     def _run(self, messages: list[dict], method_name: str = "unknown") -> str:
-        from qwen_vl_utils import process_vision_info
-        import torch
+        """Dispatch to the backend-specific inference method."""
+        self._log_input(messages, method_name)
+        if self._is_gemma or self._is_qwen3vl or self._is_qwen35:
+            response = self._run_modern(messages)
+        else:
+            response = self._run_qwen(messages)
+        logger.debug("VLM OUTPUT (method=%s):", method_name)
+        logger.debug("%s", response)
+        logger.debug("=" * 80)
+        return response
 
-        # Debug: Log the prompt being sent to VLM
+    def _log_input(self, messages: list[dict], method_name: str) -> None:
+        """Log the prompt being sent to the VLM."""
         logger.debug("=" * 80)
         logger.debug("VLM._run called from: %s", method_name)
         logger.debug("-" * 40)
@@ -1422,50 +1611,57 @@ class QwenVLAnalyzer:
             role = msg.get("role", "unknown")
             content = msg.get("content", [])
             if isinstance(content, str):
-                logger.debug("VLM INPUT [%s]: %s", role, content[:500] + "..." if len(content) > 500 else content)
+                logger.debug("VLM INPUT [%s]: %s", role,
+                             content[:500] + "..." if len(content) > 500 else content)
             else:
                 for item in content:
                     if item.get("type") == "text":
                         text = item.get("text", "")
-                        logger.debug("VLM INPUT [%s/text]: %s", role, text[:1000] + "..." if len(text) > 1000 else text)
+                        logger.debug("VLM INPUT [%s/text]: %s", role,
+                                     text[:1000] + "..." if len(text) > 1000 else text)
                     elif item.get("type") == "image":
                         logger.debug("VLM INPUT [%s/image]: <image provided>", role)
         logger.debug("-" * 40)
+        logger.debug("VLM generating response (max_new_tokens=8192)...")
+
+    def _run_qwen(self, messages: list[dict]) -> str:
+        """Qwen2.5-VL inference path."""
+        from qwen_vl_utils import process_vision_info
+        import torch
 
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+            messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
         inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
+            text=[text], images=image_inputs, videos=video_inputs,
+            padding=True, return_tensors="pt",
         )
-        # Move all tensors to device
         inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                   for k, v in inputs.items()}
-
-        logger.debug("VLM generating response (max_new_tokens=8192, temp=0.1)...")
-
         with torch.no_grad():
             output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=8192,
-                temperature=0.1,
+                **inputs, max_new_tokens=8192, temperature=0.1,
                 do_sample=False,
             )
-
         trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], output_ids)]
-        response = self.processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+        return self.processor.batch_decode(trimmed, skip_special_tokens=True)[0]
 
-        # Debug: Log the full VLM response
-        logger.debug("VLM OUTPUT (method=%s):", method_name)
-        logger.debug("%s", response)
-        logger.debug("=" * 80)
+    def _run_modern(self, messages: list[dict]) -> str:
+        """Inference via apply_chat_template — works for Gemma 4 and Qwen3-VL."""
+        import torch
 
-        return response
+        inputs = self.processor.apply_chat_template(
+            messages, tokenize=True, return_dict=True,
+            return_tensors="pt", add_generation_prompt=True,
+        ).to(self.model.device)
+        input_len = inputs["input_ids"].shape[-1]
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs, max_new_tokens=8192,
+            )
+        return self.processor.decode(
+            output_ids[0][input_len:], skip_special_tokens=True,
+        )
 
     def _parse_analysis(self, raw: str, class_name: str, default_target: str) -> VLMAnalysis:
         """Extract JSON from VLM response."""

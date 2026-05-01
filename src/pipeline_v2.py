@@ -19,6 +19,7 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
+from .__version__ import __version__
 from .analysis import StatisticalValidator
 from .config import Config
 from .model_manager import ModelManager
@@ -65,7 +67,7 @@ def _build_feature_summary(name: str, results: list) -> dict:
     }
 
 
-def _images_too_similar(original: Image.Image, edited: Image.Image, threshold: float = 0.98) -> bool:
+def _images_too_similar(original: Image.Image, edited: Image.Image, threshold: float = 0.99) -> bool:
     """Return True if edited image is nearly identical to original."""
     orig_arr = np.asarray(original.convert("RGB").resize((256, 256))).astype(np.float32)
     edit_arr = np.asarray(edited.convert("RGB").resize((256, 256))).astype(np.float32)
@@ -140,6 +142,16 @@ class ModelMeasurement:
     original_confidence: float
     edited_confidence: float
     delta: float
+
+
+@dataclass
+class PreCompletedResult:
+    """Wraps a previously-saved checkpoint dict for re-emission."""
+    class_name: str
+    data: dict
+
+    def to_dict(self) -> dict:
+        return self.data
 
 
 @dataclass
@@ -222,9 +234,12 @@ class PipelineV2:
             min_effect_size=config.min_effect_size,
             min_samples=2,
         )
+        # Inter-phase state populated by the new probe phases.
+        self._catalog: dict | None = None
+        self._manifest: dict | None = None
 
-    # Phase-first pipeline: each model loaded once, processes all classes
-    _PHASES = [
+    # Per-batch phases: re-run for each batch of classes
+    _PHASES_PER_BATCH = [
         ("Classifier: baseline",     "_phase_classify"),
         ("VLM: discovery",           "_phase_discover"),
         ("Dedup + edit generation",  "_phase_generate_edits"),
@@ -232,14 +247,59 @@ class PipelineV2:
         ("Classifier: measure",      "_phase_measure"),
         ("VLM: verdict",             "_phase_verdict"),
     ]
+    # Final phases: run once at end on union of (resumed + new) results
+    _PHASES_FINAL = [
+        ("Feature catalog",          "_phase_feature_catalog"),
+        ("Probe: generate",          "_phase_probe_generate"),
+        ("Probe: evaluate",          "_phase_probe_evaluate"),
+    ]
 
-    def run(self, classes: list[str]) -> list[ClassResultV2]:
-        """Run the full pipeline — phase-first for minimal model swaps."""
+    def run(self, classes: list[str]) -> list:
+        """Run pipeline with resume + batched checkpointing."""
         t0 = time.time()
-        results = [ClassResultV2(class_name=c) for c in classes]
+        completed = self._load_completed_checkpoints(classes) if self.cfg.resume else {}
+        todo = [c for c in classes if c not in completed]
+        self._log_resume_status(classes, completed, todo)
 
+        new_by_class = self._process_batches(todo)
+        all_results = self._merge_results(classes, completed, new_by_class)
+        self._run_final_phases(all_results)
+
+        logger.debug("PIPELINE DONE: %.1fs (%d resumed, %d new)",
+                     time.time() - t0, len(completed), len(new_by_class))
+        return all_results
+
+    def run_multi_model(self, classes: list[str]) -> list:
+        """Run with all models (measurement phase handles multi-model)."""
+        return self.run(classes)
+
+    def _process_batches(self, todo: list[str]) -> dict:
+        """Run per-batch phases on TODO classes; return new ClassResultV2 by name."""
+        if not todo:
+            return {}
+        batch_size = self.cfg.batch_size if self.cfg.batch_size > 0 else len(todo)
+        new_by_class: dict[str, ClassResultV2] = {}
+        n_batches = (len(todo) + batch_size - 1) // batch_size
+        for bi in range(n_batches):
+            batch = todo[bi * batch_size : (bi + 1) * batch_size]
+            logger.info("BATCH %d/%d: %d classes", bi + 1, n_batches, len(batch))
+            results = self._run_one_batch(batch)
+            for r in results:
+                new_by_class[r.class_name] = r
+        return new_by_class
+
+    def _run_one_batch(self, batch: list[str]) -> list[ClassResultV2]:
+        """Run all per-batch phases on one batch and checkpoint each result."""
+        results = [ClassResultV2(class_name=c) for c in batch]
+        self._run_per_batch_phases(results)
+        for r in results:
+            self._save_checkpoint(r)
+        return results
+
+    def _run_per_batch_phases(self, results: list[ClassResultV2]) -> None:
+        """Iterate per-batch phases on the given results."""
         phases = tqdm(
-            self._PHASES, desc="Pipeline", unit="phase",
+            self._PHASES_PER_BATCH, desc="Pipeline", unit="phase",
             leave=True, bar_format="{desc} |{bar:15}| {n}/{total} {postfix}",
         )
         for phase_name, method_name in phases:
@@ -253,14 +313,56 @@ class PipelineV2:
             logger.debug("PHASE %s: %.1fs", phase_name, time.time() - step_t0)
         phases.close()
 
-        for r in results:
-            self._save_checkpoint(r)
-        logger.debug("PIPELINE DONE: %.1fs, %d classes", time.time() - t0, len(results))
-        return results
+    def _run_final_phases(self, all_results: list) -> None:
+        """Run feature catalog + probe phases once on the full result set."""
+        for phase_name, method_name in self._PHASES_FINAL:
+            step_t0 = time.time()
+            try:
+                getattr(self, method_name)(all_results)
+            except Exception as e:
+                _tqdm_write(f"[ERROR] {phase_name}: {e}")
+                logger.error("Final phase '%s' failed: %s", phase_name, e, exc_info=True)
+            logger.debug("FINAL PHASE %s: %.1fs", phase_name, time.time() - step_t0)
 
-    def run_multi_model(self, classes: list[str]) -> list[ClassResultV2]:
-        """Run with all models (measurement phase handles multi-model)."""
-        return self.run(classes)
+    def _log_resume_status(self, classes: list[str], completed: dict, todo: list[str]) -> None:
+        """Print resume summary at start of run."""
+        if completed:
+            logger.info("Resume: %d/%d classes already complete, %d to do",
+                        len(completed), len(classes), len(todo))
+            _tqdm_write(f"[RESUME] {len(completed)}/{len(classes)} classes loaded "
+                        f"from checkpoints, {len(todo)} remaining")
+
+    def _merge_results(self, classes: list[str], completed: dict, new_by_class: dict) -> list:
+        """Return results in original class order, using checkpoint dicts where available."""
+        return [completed.get(c) or new_by_class.get(c) for c in classes if completed.get(c) or new_by_class.get(c)]
+
+    def _load_completed_checkpoints(self, classes: list[str]) -> dict:
+        """Load complete checkpoints for any class that has one. Returns {class_name: PreCompletedResult}."""
+        ckpt_dir = self.cfg.model_checkpoint_dir(self.cfg.classifier_model)
+        if not ckpt_dir.exists():
+            return {}
+        completed: dict[str, PreCompletedResult] = {}
+        for c in classes:
+            data = self._read_checkpoint_file(ckpt_dir, c)
+            if data is not None and self._is_complete_checkpoint(data):
+                completed[c] = PreCompletedResult(class_name=c, data=data)
+        return completed
+
+    def _read_checkpoint_file(self, ckpt_dir: Path, class_name: str) -> dict | None:
+        """Read one checkpoint JSON, returning None on missing/corrupt."""
+        path = ckpt_dir / f"{class_name.replace(' ', '_')}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except Exception as e:
+            logger.warning("Bad checkpoint for %s: %s", class_name, e)
+            return None
+
+    def _is_complete_checkpoint(self, data: dict) -> bool:
+        """True if checkpoint represents a fully-completed class (passed all per-batch phases)."""
+        summary = data.get("summary", {})
+        return bool(summary) and "total_concepts" in summary
 
     # =========================================================================
     # PHASE 1: CLASSIFIER — sample + baseline (load classifier once)
@@ -709,3 +811,77 @@ class PipelineV2:
         path = ckpt_dir / f"{result.class_name.replace(' ', '_')}.json"
         path.write_text(json.dumps(result.to_dict(), indent=2, default=str))
         logger.info("Saved checkpoint: %s", path)
+
+    # =========================================================================
+    # PHASE 7: FEATURE CATALOG (cheap aggregation; always runs)
+    # =========================================================================
+
+    def _phase_feature_catalog(self, results: list[ClassResultV2]):
+        """Aggregate per-class real/bias features across all classifier models."""
+        from src.feature_extractor import extract_catalog
+        analysis = self._results_to_analysis(results)
+        self._catalog = extract_catalog(analysis)
+        self._save_feature_catalog()
+
+    def _results_to_analysis(self, results: list[ClassResultV2]) -> dict:
+        """Shape ClassResultV2 list into the analysis_results.json format."""
+        return {
+            "version": __version__,
+            "generated_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"),
+            "results": [r.to_dict() for r in results],
+        }
+
+    def _save_feature_catalog(self) -> None:
+        """Write the feature catalog to disk."""
+        path = self.cfg.feature_catalog_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._catalog, indent=2, default=str))
+        logger.info("Saved feature catalog: %s", path)
+
+    # =========================================================================
+    # PHASE 8: PROBE GENERATION (VLM prompts + FLUX text-to-image)
+    # =========================================================================
+
+    def _phase_probe_generate(self, results: list[ClassResultV2]):
+        """Build a probe image set per class using the catalog."""
+        if self.cfg.skip_probes or not self._catalog:
+            return
+        from src.probe_generator import (
+            ProbeConfig, _manifest_to_dict, generate_probes,
+        )
+        probe_cfg = ProbeConfig(
+            n_per_variant=self.cfg.probe_n_per_variant,
+            feature_source=self.cfg.probe_feature_source,
+            mode=self.cfg.probe_mode,
+        )
+        manifest_obj = generate_probes(
+            self._catalog, self.cfg.probes_dir, probe_cfg, self.models,
+            source_catalog=str(self.cfg.feature_catalog_path),
+        )
+        self._manifest = _manifest_to_dict(manifest_obj)
+        logger.info("Saved probe manifest: %s", self.cfg.probes_dir / "manifest.json")
+
+    # =========================================================================
+    # PHASE 9: PROBE EVALUATION (every classifier × every probe image)
+    # =========================================================================
+
+    def _phase_probe_evaluate(self, results: list[ClassResultV2]):
+        """Run each classifier on the probe set; write 4-metric report + HTML."""
+        if self.cfg.skip_probes or not self._manifest:
+            return
+        from src.probe_evaluator import evaluate_probes, write_report
+        from src.probe_reporter import write_probe_report
+        manifest_path = self.cfg.probes_dir / "manifest.json"
+        model_metrics = evaluate_probes(
+            self._manifest, self.cfg.classifier_models, self.models,
+            manifest_dir=self.cfg.probes_dir,
+        )
+        write_report(model_metrics, self.cfg.probe_report_path,
+                      manifest_path=str(manifest_path))
+        logger.info("Saved probe evaluation: %s", self.cfg.probe_report_path)
+        html_path = write_probe_report(
+            manifest_path, self.cfg.probe_report_path,
+            self.cfg.reports_dir / "probe_report.html",
+        )
+        logger.info("Saved probe HTML report: %s", html_path)

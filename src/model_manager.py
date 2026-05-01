@@ -12,7 +12,7 @@ import os
 
 import torch
 
-from .classifier import ImageNetClassifier
+from .classifier import ImageNetClassifier, build_classifier
 from .config import Config
 from .dataset import ImageNetSampler
 from .editor import ImageEditor
@@ -26,7 +26,7 @@ class ModelManager:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._classifiers: dict[str, ImageNetClassifier] = {}
+        self._classifiers: dict[str, object] = {}
         self._active_classifier: str | None = None
         self._vlm: QwenVLAnalyzer | None = None
         self._editor: ImageEditor | None = None
@@ -52,20 +52,36 @@ class ModelManager:
             if name != keep and clf.loaded:
                 clf.offload()
 
-    def classifier(self, model_name: str | None = None) -> ImageNetClassifier:
-        """Get classifier by name. Auto-offloads others in low_vram mode."""
+    def classifier(self, model_name: str | None = None):
+        """Get classifier by name. Auto-offloads others in low_vram mode.
+
+        Returns either ``ImageNetClassifier``, ``CLIPClassifier``, or
+        ``HFClassifier`` depending on the registry the model name lives in.
+        CLIP/SigLIP classifiers are given a dataset-specific label bank when
+        ``cfg.dataset`` is not the default imagenet.
+        """
         name = model_name or self.cfg.classifier_model
         self._ensure_only(f"classifier:{name}")
         if name not in self._classifiers:
-            self._classifiers[name] = ImageNetClassifier(
-                model_name=name,
+            self._classifiers[name] = build_classifier(
+                name=name,
                 device=self.cfg.device,
                 attention_method=self.cfg.attention_method,
+                label_lookup=self._label_lookup_for(name),
             )
         elif not self._classifiers[name].loaded:
             self._classifiers[name].load_to_gpu()
         self._active_classifier = name
         return self._classifiers[name]
+
+    def _label_lookup_for(self, classifier_name: str):
+        """Return a LabelLookup matching the active dataset, or None."""
+        if getattr(self.cfg, "dataset", "imagenet") == "imagenet":
+            return None
+        from .clip_classifier import LabelLookup, is_clip_model
+        if not is_clip_model(classifier_name):
+            return None
+        return LabelLookup(self.sampler().get_label_names())
 
     def vlm(self) -> QwenVLAnalyzer:
         """Get VLM, loading if needed. Auto-offloads others in low_vram."""

@@ -171,10 +171,14 @@ def main():
         help="Analyze all 100 ImageNet-100 classes"
     )
 
-    # Class source
+    # Class source — None sentinel lets the --dataset preset win when not set
     parser.add_argument(
-        "--class-source", choices=["json", "dataset"], default="json",
-        help="Where to read class names: 'json' from file or 'dataset' from HF dataset (default: json)"
+        "--class-source", choices=["json", "dataset"], default=None,
+        help=(
+            "Where to read class names: 'json' from file or 'dataset' from "
+            "HF dataset. When unset, the --dataset preset picks it "
+            "(imagenet→json, cub→dataset)."
+        ),
     )
     parser.add_argument(
         "--class-file", type=str, default=None,
@@ -182,6 +186,14 @@ def main():
     )
 
     # Config overrides
+    parser.add_argument(
+        "--dataset", choices=("imagenet", "cub"), default="imagenet",
+        help=(
+            "Dataset preset: 'imagenet' (default, ILSVRC/imagenet-1k validation) "
+            "or 'cub' (bentrevett/caltech-ucsd-birds-200-2011 test split, 200 bird species). "
+            "Presets the HF dataset id, split, and class source."
+        ),
+    )
     parser.add_argument("--output-dir", default="output", help="Output directory")
     parser.add_argument(
         "--samples", type=int, default=10,
@@ -205,11 +217,21 @@ def main():
     )
     parser.add_argument(
         "--classifier", default="resnet50",
-        help="Single classifier model (default: resnet50). Ignored if --classifiers is set."
+        help=(
+            "Single classifier model (default: resnet50). "
+            "Supported: resnet50, dinov2_vitb14_lc, vit_l_16, "
+            "clip_vitb32, clip_vitl14, siglip2_base, siglip2_large. "
+            "Ignored if --classifiers is set."
+        ),
     )
     parser.add_argument(
-        "--classifiers", nargs="+", default=["resnet50", "dinov2_vitb14_lc", "vit_l_16"],
-        help="Classifier models to compare (default: all three: resnet50 dinov2_vitb14_lc vit_l_16)"
+        "--classifiers", nargs="+",
+        default=["resnet50", "dinov2_vitb14_lc", "vit_l_16"],
+        help=(
+            "Classifier models to compare. "
+            "Supported: resnet50, dinov2_vitb14_lc, vit_l_16, "
+            "clip_vitb32, clip_vitl14, siglip2_base, siglip2_large."
+        ),
     )
     parser.add_argument(
         "--vlm", default="Qwen/Qwen2.5-VL-7B-Instruct",
@@ -232,6 +254,15 @@ def main():
         help="Keep all models loaded (requires 40GB+ VRAM)"
     )
     parser.add_argument(
+        "--no-8bit-editor", action="store_true",
+        help=(
+            "Disable 8-bit/FP8 quantization + CPU-offload for the FLUX editor. "
+            "Use on 40GB+ GPUs (A100/H100): runs FLUX in pure BF16 on GPU and "
+            "removes the per-step CPU<->GPU transfer that dominates edit time. "
+            "Typically 3-5x faster on H100. Default: 8-bit ON for 24GB cards."
+        ),
+    )
+    parser.add_argument(
         "--attention", choices=["gradcam", "gradcam++", "scorecam"],
         default="scorecam",
         help="Attention map method: gradcam, gradcam++, or scorecam (default: scorecam)"
@@ -247,6 +278,52 @@ def main():
     parser.add_argument(
         "--random-classes", action="store_true",
         help="Randomly select classes from dataset instead of taking first N"
+    )
+    parser.add_argument(
+        "--no-probes", action="store_true",
+        help=(
+            "Skip probe-pipeline phases 8 (image generation) and 9 (cross-model evaluation). "
+            "Phase 7 (feature catalog) still runs — it is cheap."
+        ),
+    )
+    parser.add_argument(
+        "--probe-samples", type=int, default=None,
+        help=(
+            "Probe images per variant per class. Default: auto — ceil(sqrt(k)) "
+            "where k is the number of biased features discovered for that class. "
+            "Explicit values override the auto formula for every class."
+        ),
+    )
+    parser.add_argument(
+        "--probe-mode", choices=("round_robin", "vlm_discretion"),
+        default="round_robin",
+        help=(
+            "How biased features are distributed across probe prompts. "
+            "'round_robin' (default): partition features into N groups, each "
+            "prompt uses a different group (guarantees every feature is used). "
+            "'vlm_discretion': VLM picks which features to emphasize (may skip some)."
+        ),
+    )
+    parser.add_argument(
+        "--probe-feature-source", choices=("strict", "any"), default="any",
+        help=(
+            "Which consensus level drives probe prompts: 'any' (default — union, "
+            "a feature is flagged as biased if at least ONE classifier called it "
+            "spurious) or 'strict' (intersection — all classifiers must agree)."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=0,
+        help=(
+            "Process classes in batches of this size and checkpoint after each batch. "
+            "Default 0 = run all classes in one batch (no incremental checkpoints). "
+            "Recommended for long runs (e.g. 20 for the 357-class Salient ImageNet run) "
+            "so a crash only loses one batch's worth of work."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume", action="store_true",
+        help="Ignore existing checkpoints and reprocess every class from scratch.",
     )
     parser.add_argument("--log-level", default="INFO", help="Console logging level (default: INFO)")
     parser.add_argument(
@@ -280,7 +357,13 @@ def main():
         class_file_overrides["class_file"] = Path(args.class_file)
     # Resolve classifier models: --classifiers takes precedence over --classifier
     classifier_models = args.classifiers if args.classifiers else [args.classifier]
-    cfg = Config(
+    from src.config import get_config
+    # Only forward class_source if user explicitly set it; otherwise let preset win.
+    optional_class_source = (
+        {"class_source": args.class_source} if args.class_source else {}
+    )
+    cfg = get_config(
+        dataset=args.dataset,
         classifier_model=classifier_models[0],
         classifier_models=classifier_models,
         vlm_model=args.vlm,
@@ -298,7 +381,14 @@ def main():
         random_classes=args.random_classes,
         verify_edits=args.verify,
         hf_token=args.hf_token or load_hf_token(),
-        class_source=args.class_source,
+        skip_probes=args.no_probes,
+        probe_n_per_variant=args.probe_samples,
+        probe_feature_source=args.probe_feature_source,
+        probe_mode=args.probe_mode,
+        batch_size=args.batch_size,
+        resume=not args.no_resume,
+        use_8bit_editor=not args.no_8bit_editor,
+        **optional_class_source,
         **class_file_overrides,
     )
 
