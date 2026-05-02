@@ -18,8 +18,8 @@ wheels/
 # Pipeline output
 output/
 
-# Downloaded models
-models/
+# Downloaded models (top-level only — does NOT match src/models/)
+/models/
 
 # IDE
 .idea/

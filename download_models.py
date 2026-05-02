@@ -33,14 +33,22 @@ def main():
     try:
         from datasets import load_dataset
         from src.config import load_hf_token
+        from src.dataset import _split_only_data_files
         token = load_hf_token()
         if not token:
             print("      ERROR: No HuggingFace token found!")
             print("      Set HF_TOKEN env var or add token to .token file")
             success = False
         else:
-            # Download full dataset (not streaming) so it's cached
-            ds = load_dataset("ILSVRC/imagenet-1k", split="validation", token=token)
+            # Constrain to validation parquet shards only — the multi-split
+            # parquet builder otherwise downloads all of train (~144 GB).
+            ds = load_dataset(
+                "ILSVRC/imagenet-1k",
+                data_files=_split_only_data_files("ILSVRC/imagenet-1k", "validation"),
+                split="validation",
+                token=token,
+                verification_mode="no_checks",
+            )
             print(f"      OK: Dataset downloaded ({len(ds)} samples)")
             del ds
     except Exception as e:

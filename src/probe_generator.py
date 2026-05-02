@@ -31,6 +31,7 @@ _VARIANTS: tuple[str, ...] = (
     "bias_heavy", "bias_stripped", "real_feature_only", "adversarial",
 )
 _DEFAULT_SEED_BASE = 42
+_DEFAULT_N_PER_VARIANT = 4
 _VALID_MODES = ("round_robin", "vlm_discretion")
 
 
@@ -300,6 +301,8 @@ def _cli_parse_args(argv: list[str] | None = None):
     p.add_argument("--feature-source", choices=("strict", "any"), default="strict")
     p.add_argument("--seed-base", type=int, default=_DEFAULT_SEED_BASE)
     p.add_argument("--low-vram", action="store_true")
+    p.add_argument("--high-vram", action="store_true")
+    p.add_argument("--no-8bit-editor", action="store_true")
     return p.parse_args(argv)
 
 
@@ -307,7 +310,10 @@ def _cli_main(argv: list[str] | None = None) -> None:
     from .config import Config
     from .model_manager import ModelManager
     args = _cli_parse_args(argv)
-    cfg = Config(low_vram=args.low_vram)
+    cfg = Config(
+        low_vram=args.low_vram and not args.high_vram,
+        use_8bit_editor=not args.no_8bit_editor,
+    )
     models = ModelManager(cfg)
     catalog = load_catalog(args.catalog)
     probe_cfg = ProbeConfig(

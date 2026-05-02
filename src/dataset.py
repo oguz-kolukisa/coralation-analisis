@@ -44,6 +44,22 @@ def suppress_output():
             tqdm.tqdm.__init__ = original_tqdm_init
 
 
+_SPLIT_ONLY_PATTERNS: dict[str, str] = {
+    # The parquet builder for these datasets lists train+val+test data_files
+    # at config time, so load_dataset(..., split=X) downloads ALL splits before
+    # slicing. Constraining data_files to the requested split avoids that.
+    "ILSVRC/imagenet-1k": "data/{split}-*.parquet",
+}
+
+
+def _split_only_data_files(dataset_name: str, split: str) -> dict | None:
+    """Return data_files mapping that constrains download to one split, or None."""
+    pattern = _SPLIT_ONLY_PATTERNS.get(dataset_name)
+    if pattern is None:
+        return None
+    return {split: pattern.format(split=split)}
+
+
 def _matches_label(query: str, label: str) -> bool:
     """Check if query matches label by exact synonym matching."""
     query_lower = query.lower().strip()
@@ -82,8 +98,10 @@ class ImageNetSampler:
         with suppress_output():
             self._ds = load_dataset(
                 dataset_name,
+                data_files=_split_only_data_files(dataset_name, split),
                 split=split,
                 token=hf_token,
+                verification_mode="no_checks",
             )
         self._max_scan = max_scan
         self._seed = seed if seed is not None else int(time.time())

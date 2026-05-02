@@ -1,6 +1,6 @@
 [project]
 name = "coralation-analisis"
-version = "0.4.0"
+version = "0.5.0"
 description = "Automated bias/shortcut discovery tool for image classification models"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,11 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "gpu: GPU integration tests (require --gpu flag to run)",
+]
+
+[dependency-groups]
+dev = [
+    "scikit-learn>=1.8.0",
 ]
 
 [project.scripts]
