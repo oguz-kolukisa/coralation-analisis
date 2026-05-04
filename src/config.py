@@ -180,8 +180,8 @@ _DATASET_PRESETS: dict[str, dict] = {
         "class_source": "dataset",
     },
     "colored_mnist": {
-        # Local imagefolder built from H5 files (see /coralation-analisis/setup/download_colored_mnist_h5.py)
-        "hf_dataset": "/root/data/colored_mnist_28",
+        # Local imagefolder built from H5 files (see setup/download_colored_mnist_h5.py)
+        "hf_dataset": "/workspace/data/colored_mnist_28",
         "hf_dataset_split": "test",
         "class_source": "dataset",
     },
