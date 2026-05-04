@@ -98,6 +98,16 @@ def _obvious_verdict(feature_type, edit_type, target, delta, threshold=0.10) -> 
     return None
 
 
+def _open_grad(rec):
+    """Open gradcam image for a record, or None if not present."""
+    if rec.gradcam_path:
+        try:
+            return Image.open(rec.gradcam_path)
+        except Exception:
+            return None
+    return None
+
+
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
@@ -388,27 +398,54 @@ class PipelineV2:
     # =========================================================================
 
     def _phase_discover(self, results: list[ClassResultV2]):
-        """Discover features for all classes with one VLM load."""
+        """Discover features for all classes — batched VLM calls."""
         vlm = self.models.vlm()
-        # Flatten: all (result, image, index) across all classes
-        all_images = [
-            (r, rec, i)
-            for r in results
-            for i, rec in enumerate(r.images)
-        ]
-        pbar = tqdm(all_images, desc="  Discovering", unit="img", leave=True)
-        for result, rec, idx in pbar:
-            pbar.set_description(f"  Discovering [{result.class_name[:20]}]")
-            try:
-                if rec.target_type == "positive":
-                    self._discover_positive(vlm, result, rec, idx)
-                else:
-                    self._discover_negative(vlm, result, rec, idx)
-            except Exception as e:
-                _tqdm_write(f"  [ERROR] {result.class_name}: {e}")
-                logger.error("Discovery failed for %s img %d: %s", result.class_name, idx, e)
-        pbar.close()
+        bs = max(1, int(getattr(self.cfg, "vlm_batch_size", 4)))
+        positives, negatives = self._gather_discovery_inputs(results)
+        if positives:
+            self._batched_discover_positives(vlm, positives, bs)
+        if negatives:
+            self._batched_discover_negatives(vlm, negatives, bs)
         self.models.offload_vlm()
+
+    def _gather_discovery_inputs(self, results):
+        """Split images into (positives_with_refs, negatives_with_refs)."""
+        positives = []
+        negatives = []
+        for r in results:
+            for i, rec in enumerate(r.images):
+                if rec.target_type == "positive":
+                    positives.append((r, rec, i))
+                else:
+                    negatives.append((r, rec, i))
+        return positives, negatives
+
+    def _batched_discover_positives(self, vlm, positives, bs):
+        """Run target + env discovery for all positive images, batched."""
+        target_items = [(rec.image, _open_grad(rec), r.class_name, i) for (r, rec, i) in positives]
+        env_items = [(rec.image, r.class_name, i) for (r, rec, i) in positives]
+        pbar = tqdm(total=len(positives) * 2, desc="  Discovering [pos]", unit="call", leave=True)
+        target_lists = vlm.discover_target_features_batch(target_items, batch_size=bs)
+        pbar.update(len(positives))
+        env_lists = vlm.discover_environmental_features_batch(env_items, batch_size=bs)
+        pbar.update(len(positives))
+        pbar.close()
+        for (r, rec, _), tlist, elist in zip(positives, target_lists, env_lists):
+            for concepts in (tlist, elist):
+                rec.concepts.extend(concepts)
+                r.concepts.extend(concepts)
+
+    def _batched_discover_negatives(self, vlm, negatives, bs):
+        """Run negative-feature discovery for all negative images, batched."""
+        items = [(rec.image, _open_grad(rec), r.class_name, rec.label, rec.confidence, i)
+                 for (r, rec, i) in negatives]
+        pbar = tqdm(total=len(negatives), desc="  Discovering [neg]", unit="call", leave=True)
+        neg_lists = vlm.discover_negative_features_batch(items, batch_size=bs)
+        pbar.update(len(negatives))
+        pbar.close()
+        for (r, rec, _), concepts in zip(negatives, neg_lists):
+            rec.concepts.extend(concepts)
+            r.concepts.extend(concepts)
 
     # =========================================================================
     # PHASE 3: DEDUP + EDIT GEN (VLM loaded once, flatten all features)
@@ -457,31 +494,56 @@ class PipelineV2:
     # =========================================================================
 
     def _phase_edit_images(self, results: list[ClassResultV2]):
-        """Apply all edits for all classes with one editor load."""
+        """Apply all edits for all classes with one editor load (batched)."""
         editor = self.models.editor()
         all_pairs = self._collect_all_edit_pairs(results)
-        pbar = tqdm(all_pairs, desc="  Editing", unit="edit", leave=True)
-        for result, plan, image_rec, idx in pbar:
-            pbar.set_description(f"  Editing [{result.class_name[:20]}]")
-            class_dir = self._make_class_dir(result.class_name)
-            safe_name = plan.feature_name.replace(" ", "_")[:20]
-            edit_path = class_dir / f"{image_rec.target_type}_{safe_name}_{plan.edit_type}_{idx}.jpg"
+        if not all_pairs:
+            self.models.offload_editor()
+            return
+        bs = max(1, int(getattr(self.cfg, "edit_batch_size", 8)))
+        n = len(all_pairs)
+        pbar = tqdm(total=n, desc="  Editing", unit="edit", leave=True)
+        for start in range(0, n, bs):
+            chunk = all_pairs[start:start + bs]
+            self._edit_chunk(editor, chunk, pbar)
+        pbar.close()
+        self.models.offload_editor()
+
+    def _edit_chunk(self, editor, chunk, pbar):
+        """Run one batched edit and persist outputs/failures."""
+        imgs = [c[2].image for c in chunk]
+        prompts = [c[1].edit_instruction for c in chunk]
+        first_class = chunk[0][0].class_name[:20]
+        pbar.set_description(f"  Editing [{first_class}]")
+        try:
+            edited_list = editor.edit_batch(imgs, prompts, seed=42)
+        except Exception as e:
+            _tqdm_write(f"  [WARN] batch edit failed: {e}; falling back to per-image")
+            edited_list = [None] * len(chunk)
+        for (result, plan, image_rec, idx), edited in zip(chunk, edited_list):
+            self._persist_edit(result, plan, image_rec, idx, edited, editor)
+            pbar.update(1)
+
+    def _persist_edit(self, result, plan, image_rec, idx, edited, editor):
+        """Save one edited image and record the result."""
+        class_dir = self._make_class_dir(result.class_name)
+        safe_name = plan.feature_name.replace(" ", "_")[:20]
+        edit_path = class_dir / f"{image_rec.target_type}_{safe_name}_{plan.edit_type}_{idx}.jpg"
+        if edited is None:
             try:
                 edited = editor.edit(image_rec.image, plan.edit_instruction)
-                edited.save(edit_path)
-                failed = _images_too_similar(image_rec.image, edited)
-                if failed:
-                    _tqdm_write(f"  [WARN] Edit unchanged: {plan.feature_name}")
-                result.edit_results.append(EditResultV2(
-                    edit=plan, image_record=image_rec,
-                    edited_image_path=str(edit_path),
-                    edit_failed=failed,
-                ))
             except Exception as e:
                 _tqdm_write(f"  [WARN] Edit failed: {plan.feature_name}: {e}")
                 logger.warning("Edit failed: %s — %s", plan.edit_instruction[:50], e)
-        pbar.close()
-        self.models.offload_editor()
+                return
+        edited.save(edit_path)
+        failed = _images_too_similar(image_rec.image, edited)
+        if failed:
+            _tqdm_write(f"  [WARN] Edit unchanged: {plan.feature_name}")
+        result.edit_results.append(EditResultV2(
+            edit=plan, image_record=image_rec,
+            edited_image_path=str(edit_path), edit_failed=failed,
+        ))
 
     def _collect_all_edit_pairs(self, results):
         """Flatten all edit-image pairs across all classes."""

@@ -321,6 +321,77 @@ class ImageEditor:
             logger.error("Full traceback:", exc_info=True)
             raise
 
+    def edit_batch(self, images: list, instructions: list[str],
+                   seed: int = 42, batch_size: int = 8) -> list:
+        """Apply edits in batches, bucketed by per-image snap_dims.
+
+        Each image keeps its native snapped size (no upscale to 768x768 — that
+        wastes compute on tiny inputs). Same-size images batch together.
+        Falls back to single-image edit() on OOM or any batch error.
+        """
+        import torch
+        if len(images) != len(instructions):
+            raise ValueError("images and instructions must have same length")
+        n = len(images)
+        if n == 0:
+            return []
+        edited: list = [None] * n
+        buckets = self._bucket_by_snap(images)
+        actual_steps = _FLUX_STEPS if self._is_flux else _NUM_STEPS
+        for (tw, th), idx_list in buckets.items():
+            self._run_bucket(idx_list, images, instructions, edited,
+                             tw, th, batch_size, actual_steps, seed)
+        return edited
+
+    def _bucket_by_snap(self, images: list) -> dict:
+        """Group image indices by their snapped (w, h)."""
+        buckets: dict = {}
+        for i, img in enumerate(images):
+            tw, th = self._snap_dims(*img.size)
+            buckets.setdefault((tw, th), []).append(i)
+        return buckets
+
+    def _run_bucket(self, idx_list, images, instructions, edited,
+                    tw, th, batch_size, steps, seed):
+        """Process one (tw, th) bucket; all images resized to that size."""
+        import torch
+        for start in range(0, len(idx_list), batch_size):
+            stop = min(start + batch_size, len(idx_list))
+            sub = idx_list[start:stop]
+            imgs = [images[i].convert("RGB").resize((tw, th), Image.LANCZOS) for i in sub]
+            prompts = [f"{instructions[i]}. Keep everything else unchanged." for i in sub]
+            origs = [images[i].size for i in sub]
+            try:
+                out = self._run_batch(imgs, prompts, seed + start, steps)
+            except (torch.cuda.OutOfMemoryError, Exception) as e:
+                logger.warning("edit_batch bucket %dx%d fallback at [%d:%d]: %s",
+                               tw, th, start, stop, e)
+                torch.cuda.empty_cache()
+                out = [self.edit(images[i], instructions[i], seed=seed + j)
+                       for j, i in enumerate(sub)]
+            for j, i in enumerate(sub):
+                edited[i] = out[j].resize(origs[j], Image.LANCZOS)
+
+    def _run_batch(self, imgs: list, prompts: list[str], seed: int, steps: int) -> list:
+        """Single batched diffusion call; backend-specific kwargs."""
+        import torch
+        gen = self._make_generator(seed)
+        with torch.inference_mode():
+            if self._is_flux:
+                result = self.pipe(prompt=prompts, image=imgs,
+                                   num_inference_steps=steps, generator=gen)
+            elif self._is_qwen:
+                result = self.pipe(image=imgs, prompt=prompts, generator=gen,
+                                   true_cfg_scale=_TEXT_GUIDANCE,
+                                   negative_prompt=" " * len(prompts),
+                                   num_inference_steps=steps)
+            else:
+                result = self.pipe(prompt=prompts, image=imgs,
+                                   num_inference_steps=steps,
+                                   image_guidance_scale=_IMAGE_GUIDANCE,
+                                   guidance_scale=_TEXT_GUIDANCE, generator=gen)
+        return list(result.images)
+
     def generate_from_text(self, prompt: str, seed: int = 42,
                             size: tuple[int, int] = (768, 768)) -> Image.Image:
         """Text-to-image via the FLUX pipe (image=None). Same 4-step config as edit()."""

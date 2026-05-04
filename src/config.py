@@ -107,6 +107,9 @@ class Config(BaseModel):
     output_dir: Path = Path("output")
     resume: bool = True                 # resume from checkpoint if available
     batch_size: int = 0                 # process classes in batches (0 = all at once)
+    edit_batch_size: int = 32           # FLUX/Qwen-Edit batch size per pipe() call (H200 fits 32+, edit_batch falls back on OOM)
+    verdict_batch_size: int = 16        # VLM batch size for verdict phase
+    vlm_batch_size: int = 8             # VLM batch size for discovery phase (target/env/negative)
 
     # --- Runtime ---
     device: str = "cuda"

@@ -929,6 +929,113 @@ class QwenVLAnalyzer:
             "environmental", source_image,
         )
 
+    def discover_target_features_batch(
+        self, items: list[tuple], batch_size: int = 4,
+    ) -> list[list[FeatureConcept]]:
+        """Batched target-feature discovery.
+
+        items: list of (image, gradcam, class_name, source_image) tuples.
+        Returns list of FeatureConcept lists (one per input item).
+        """
+        messages_list = [
+            [{"role": "user", "content": self._build_target_content(img, gc, cls)}]
+            for (img, gc, cls, _) in items
+        ]
+        raws = self.chat_batch(messages_list, batch_size=batch_size,
+                               method_name="discover_target_features_batch")
+        return [self._parse_concepts(r, "target", src)
+                for r, (_, _, _, src) in zip(raws, items)]
+
+    def discover_environmental_features_batch(
+        self, items: list[tuple], batch_size: int = 4,
+    ) -> list[list[FeatureConcept]]:
+        """Batched environmental-feature discovery.
+
+        items: list of (image, class_name, source_image) tuples.
+        """
+        messages_list = [
+            [{"role": "user", "content": self._build_env_content(img, cls)}]
+            for (img, cls, _) in items
+        ]
+        raws = self.chat_batch(messages_list, batch_size=batch_size,
+                               method_name="discover_environmental_features_batch")
+        return [self._parse_concepts(r, "environmental", src)
+                for r, (_, _, src) in zip(raws, items)]
+
+    def discover_negative_features_batch(
+        self, items: list[tuple], batch_size: int = 4,
+    ) -> list[list[FeatureConcept]]:
+        """Batched negative-feature discovery.
+
+        items: list of (image, gradcam, class_name, true_label, confidence, source_image) tuples.
+        """
+        messages_list = [
+            [{"role": "user", "content": self._build_negative_content(img, gc, cls, true, conf)}]
+            for (img, gc, cls, true, conf, _) in items
+        ]
+        raws = self.chat_batch(messages_list, batch_size=batch_size,
+                               method_name="discover_negative_features_batch")
+        return [self._parse_concepts(r, "negative", src)
+                for r, (*_, src) in zip(raws, items)]
+
+    def _build_target_content(self, image, gradcam, class_name: str) -> list:
+        """Build content list for target-feature discovery (factored out for batch + single)."""
+        prompt = (
+            f"Target class: {class_name}\n\n"
+            "I'm showing you an image and the model's attention heatmap "
+            "(red = high focus, blue = low).\n\n"
+            "List every visual CONCEPT the model focuses on. "
+            "Give short names (1-3 words). "
+            "Include body parts, textures, colors, shapes.\n\n"
+            "Example output:\n"
+            '{"features": [{"name": "dorsal fin", "attention": "high"}, '
+            '{"name": "body stripes", "attention": "medium"}, '
+            '{"name": "eye shape", "attention": "low"}]}'
+            + self._JSON_INSTRUCTION
+        )
+        content = [{"type": "image", "image": image}]
+        if gradcam:
+            content.append({"type": "image", "image": gradcam})
+        content.append({"type": "text", "text": prompt})
+        return content
+
+    def _build_env_content(self, image, class_name: str) -> list:
+        """Build content list for environmental-feature discovery."""
+        prompt = (
+            f"Target class: {class_name}\n\n"
+            f"List all environmental and contextual elements in this image "
+            f"that are NOT part of the {class_name} itself. "
+            "Include: background, setting, lighting, co-occurring objects, "
+            "surfaces, other animals/people.\n\n"
+            "Example output:\n"
+            '{"features": [{"name": "ocean background"}, '
+            '{"name": "fishing net"}, {"name": "person holding fish"}]}'
+            + self._JSON_INSTRUCTION
+        )
+        return [{"type": "image", "image": image}, {"type": "text", "text": prompt}]
+
+    def _build_negative_content(self, image, gradcam, class_name: str,
+                                 true_label: str, confidence: float) -> list:
+        """Build content list for negative-feature discovery."""
+        prompt = (
+            f"Target class: {class_name}\n"
+            f"This image is actually a {true_label}, NOT a {class_name}.\n"
+            f"The model gives it {confidence:.0%} confidence as {class_name}.\n\n"
+            "I'm showing you the image and the model's attention heatmap "
+            f"for {class_name} (red = high focus).\n\n"
+            "What visual concepts cause the model to confuse this "
+            f"{true_label} with {class_name}?\n\n"
+            "Example output:\n"
+            '{"features": [{"name": "similar body shape", "attention": "high"}, '
+            '{"name": "blue water", "attention": "medium"}]}'
+            + self._JSON_INSTRUCTION
+        )
+        content = [{"type": "image", "image": image}]
+        if gradcam:
+            content.append({"type": "image", "image": gradcam})
+        content.append({"type": "text", "text": prompt})
+        return content
+
     def _parse_concepts(self, raw: str, feat_type: str, source_image: int) -> list[FeatureConcept]:
         """Parse VLM response into FeatureConcept list."""
         try:
@@ -1623,6 +1730,59 @@ class QwenVLAnalyzer:
                         logger.debug("VLM INPUT [%s/image]: <image provided>", role)
         logger.debug("-" * 40)
         logger.debug("VLM generating response (max_new_tokens=8192)...")
+
+    def chat_batch(self, messages_list: list[list[dict]],
+                   batch_size: int = 8, method_name: str = "batch") -> list[str]:
+        """Process N independent chat conversations in batches.
+
+        Falls back to single-message _run on per-batch failures.
+        """
+        import torch
+        results: list[str] = [""] * len(messages_list)
+        if not messages_list:
+            return results
+        for start in range(0, len(messages_list), batch_size):
+            stop = min(start + batch_size, len(messages_list))
+            chunk = messages_list[start:stop]
+            try:
+                if self._is_gemma or self._is_qwen3vl or self._is_qwen35:
+                    out = [self._run_modern(m) for m in chunk]  # batch path needs per-model work
+                else:
+                    out = self._run_qwen_batch(chunk)
+            except (torch.cuda.OutOfMemoryError, Exception) as e:
+                logger.warning("chat_batch [%d:%d] fallback to per-msg: %s", start, stop, e)
+                torch.cuda.empty_cache()
+                out = [self._run(m, method_name) for m in chunk]
+            for j, r in enumerate(out):
+                results[start + j] = r
+        return results
+
+    def _run_qwen_batch(self, messages_list: list[list[dict]]) -> list[str]:
+        """Qwen2.5-VL batched inference: padding, batch generate, batch decode."""
+        from qwen_vl_utils import process_vision_info
+        import torch
+        texts = [self.processor.apply_chat_template(
+            m, tokenize=False, add_generation_prompt=True) for m in messages_list]
+        all_imgs: list = []
+        all_vids: list = []
+        for m in messages_list:
+            imgs, vids = process_vision_info(m)
+            if imgs:
+                all_imgs.extend(imgs)
+            if vids:
+                all_vids.extend(vids)
+        inputs = self.processor(
+            text=texts, images=all_imgs or None, videos=all_vids or None,
+            padding=True, return_tensors="pt",
+        )
+        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                  for k, v in inputs.items()}
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs, max_new_tokens=2048, temperature=0.1, do_sample=False,
+            )
+        trimmed = [o[len(i):] for i, o in zip(inputs["input_ids"], output_ids)]
+        return self.processor.batch_decode(trimmed, skip_special_tokens=True)
 
     def _run_qwen(self, messages: list[dict]) -> str:
         """Qwen2.5-VL inference path."""
