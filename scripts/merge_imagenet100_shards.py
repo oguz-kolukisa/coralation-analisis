@@ -24,7 +24,7 @@ from src.reporter import Reporter
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
-ROOT = Path("/workspace/imagenet100")
+ROOT = Path("/root/runs/imagenet100")
 SHARD_DIRS = [
     ROOT / "shard_0_25" / "output",
     ROOT / "shard_25_50" / "output",

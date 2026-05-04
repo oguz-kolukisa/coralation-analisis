@@ -1,31 +1,33 @@
 #!/usr/bin/env bash
 # 6-GPU parallel paper-sweep driver for a single 6×H200 instance.
 #
-#   Cell 1 (Colored MNIST) is already done — see /workspace/colored_mnist/.
-#   Cell 2 (Waterbirds), 3 (NICO++), 4 (ImageNet-100 split into 4 shards) run in
-#   parallel, each pinned to one GPU via CUDA_VISIBLE_DEVICES.
+# Layout:
+#   GPU 0: Waterbirds, then Colored MNIST (sequential)  ~4.5 h
+#   GPU 1: NICO++                                        ~3 h
+#   GPU 2: ImageNet-100 classes 0-24                     ~3.5 h
+#   GPU 3: ImageNet-100 classes 25-49                    ~3.5 h
+#   GPU 4: ImageNet-100 classes 50-74                    ~3.5 h
+#   GPU 5: ImageNet-100 classes 75-99                    ~3.5 h
 #
-# Total wall clock target: ~3.5 hours.
+# Wall-clock target: ~4.5 hours.
 #
-# Usage:
-#   cd /workspace/coralation-analisis
-#   uv sync           # one-time per fresh box
+# Usage (from the repo root, after setup/bootstrap_h200.sh has finished):
 #   bash scripts/run_6gpu.sh
 #
-# After all 6 finish, run the merge:
+# After all GPUs finish:
 #   uv run python scripts/merge_imagenet100_shards.py
 set -euo pipefail
 
-# All caches/datasets/outputs live under /workspace
-source /workspace/coralation-analisis/setup/env_workspace.sh
+# Caches live on rootfs (single-machine; /workspace not shared anymore)
+source /coralation-analisis/setup/env.sh
 
-ROOT=/workspace
+ROOT=/root/runs
 LOGS="$ROOT/logs"
-mkdir -p "$LOGS" "$ROOT/waterbirds" "$ROOT/nicopp" "$ROOT/imagenet100"
+mkdir -p "$LOGS" "$ROOT/waterbirds" "$ROOT/colored_mnist" "$ROOT/nicopp" "$ROOT/imagenet100"
 
 # Optional HF token
-if [[ -f /workspace/coralation-analisis/.token ]]; then
-    export HF_TOKEN="$(cat /workspace/coralation-analisis/.token)"
+if [[ -f /coralation-analisis/.token ]]; then
+    export HF_TOKEN="$(cat /coralation-analisis/.token)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -99,21 +101,44 @@ COMMON=(
     --top-negative-classes 5
 )
 
-cd /workspace/coralation-analisis
+cd /coralation-analisis
 
 echo "[$(date +%H:%M:%S)] Launching 6 GPU-pinned cells in parallel"
 
-# GPU 0 — Waterbirds
-CUDA_VISIBLE_DEVICES=0 nohup uv run python main.py \
+# GPU 0 — Waterbirds, then Colored MNIST (sequential in one bash subshell)
+COLORED_MNIST_MODELS=(
+    mnist_resnet_paulgavrikov mnist_vit_farleyknight mnist_siglip2
+    clip_vitb32 clip_vitb16 clip_vitl14 clip_vitl14_336
+    siglip2_base siglip2_base_256 siglip2_base_384 siglip2_base_512
+    siglip2_large siglip2_large_384 siglip2_large_512
+    siglip2_giant_256 siglip2_giant_384
+)
+DIGITS=(zero one two three four five six seven eight nine)
+
+CUDA_VISIBLE_DEVICES=0 nohup bash -c "
+set -euo pipefail
+cd /coralation-analisis
+echo '[GPU0] Waterbirds start'
+uv run python main.py \
     --dataset waterbirds \
-    --classifiers "${WATERBIRDS_MODELS[@]}" \
+    --classifiers ${WATERBIRDS_MODELS[*]} \
     --class-names waterbird landbird \
     --samples 300 --negative-samples 300 --top-negative-classes 1 \
     --generations 3 --attention scorecam \
-    --output-dir "$ROOT/waterbirds/output" \
-    > "$LOGS/gpu0_waterbirds.log" 2>&1 &
+    --output-dir $ROOT/waterbirds/output
+echo '[GPU0] Waterbirds done; Colored MNIST start'
+uv run python main.py \
+    --dataset colored_mnist \
+    --classifiers ${COLORED_MNIST_MODELS[*]} \
+    --class-names ${DIGITS[*]} \
+    --samples 100 \
+    --generations 3 --attention scorecam \
+    --negative-samples 10 --top-negative-classes 5 \
+    --output-dir $ROOT/colored_mnist/output
+echo '[GPU0] Colored MNIST done'
+" > "$LOGS/gpu0_waterbirds_then_mnist.log" 2>&1 &
 PID_WB=$!
-echo "  GPU0 Waterbirds              PID=$PID_WB"
+echo "  GPU0 Waterbirds → Colored MNIST   PID=$PID_WB"
 
 # GPU 1 — NICO++
 CUDA_VISIBLE_DEVICES=1 nohup uv run python main.py \

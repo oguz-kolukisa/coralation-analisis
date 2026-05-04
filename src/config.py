@@ -181,13 +181,15 @@ _DATASET_PRESETS: dict[str, dict] = {
     },
     "colored_mnist": {
         # Local imagefolder built from H5 files (see setup/download_colored_mnist_h5.py)
-        "hf_dataset": "/workspace/data/colored_mnist_28",
+        "hf_dataset": "/root/data/colored_mnist_28",
         "hf_dataset_split": "test",
         "class_source": "dataset",
     },
     "nicopp": {
         # Local layout: <root>/<domain>/<class>/*.jpg (6 domains, 20 classes)
-        "hf_dataset": "/workspace/data/nicopp/NICOpp",
+        # Built by setup/bootstrap_h200.sh which extracts the official NICO++
+        # zip to /root/data/nicopp/NICOpp.
+        "hf_dataset": "/root/data/nicopp/NICOpp",
         "hf_dataset_split": "test",
         "class_source": "dataset",
     },
