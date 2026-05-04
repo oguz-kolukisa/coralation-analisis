@@ -164,8 +164,30 @@ _DATASET_PRESETS: dict[str, dict] = {
         "hf_dataset_split": "validation",
         "class_source": "json",
     },
+    "imagenet100": {
+        "hf_dataset": "clane9/imagenet-100",
+        "hf_dataset_split": "validation",
+        "class_source": "dataset",
+    },
     "cub": {
         "hf_dataset": "bentrevett/caltech-ucsd-birds-200-2011",
+        "hf_dataset_split": "test",
+        "class_source": "dataset",
+    },
+    "waterbirds": {
+        "hf_dataset": "grodino/waterbirds",
+        "hf_dataset_split": "test",
+        "class_source": "dataset",
+    },
+    "colored_mnist": {
+        # Local imagefolder built from H5 files (see /coralation-analisis/setup/download_colored_mnist_h5.py)
+        "hf_dataset": "/root/data/colored_mnist_28",
+        "hf_dataset_split": "test",
+        "class_source": "dataset",
+    },
+    "nicopp": {
+        # Local layout: <root>/<domain>/<class>/*.jpg (6 domains, 20 classes)
+        "hf_dataset": "/workspace/data/nicopp/NICOpp",
         "hf_dataset_split": "test",
         "class_source": "dataset",
     },

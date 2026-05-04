@@ -27,10 +27,28 @@ logger = logging.getLogger(__name__)
 _HF_REGISTRY: dict[str, dict] = {
     "swin_cub": {
         # Swin-Large fine-tuned on CUB-200-2011 (200 bird species).
-        # NOTE: HaotianZG/vit-cub-200-2011-bird was rejected — despite the
-        # repo name its id2label still exposes ImageNet-1K (1000 classes).
         "hf_id": "Emiel/cub-200-bird-classifier-swin",
         "arch": "swin",
+    },
+    # Colored MNIST classifiers
+    "mnist_vit_farleyknight": {
+        "hf_id": "farleyknight/mnist-digit-classification-2022-09-04",
+        "arch": "vit",
+        # id2label = "0".."9" — remap to digit words for class-name matching
+        "label_override": ["zero","one","two","three","four","five","six","seven","eight","nine"],
+    },
+    "mnist_siglip2": {
+        "hf_id": "prithivMLmods/Mnist-Digits-SigLIP2",
+        "arch": "siglip",
+        "label_override": ["zero","one","two","three","four","five","six","seven","eight","nine"],
+    },
+    "mnist_resnet_paulgavrikov": {
+        # Color-aware MNIST ResNet (3-channel, 28x28). Repo lacks
+        # preprocessor_config.json so we supply our own transform.
+        "hf_id": "paulgavrikov/mnist-resnet-color-noise-fg",
+        "arch": "resnet",
+        "label_override": ["zero","one","two","three","four","five","six","seven","eight","nine"],
+        "manual_transform": "mnist_28_3ch",
     },
 }
 
@@ -43,6 +61,20 @@ def available_hf_classifiers() -> list[str]:
 def is_hf_classifier(name: str) -> bool:
     """True if ``name`` names a HF classification checkpoint."""
     return name in _HF_REGISTRY
+
+
+def _build_manual_transform(name: str | None):
+    """Return a torchvision Compose for the named manual-transform spec, else None."""
+    if name is None:
+        return None
+    from torchvision import transforms
+    if name == "mnist_28_3ch":
+        return transforms.Compose([
+            transforms.Resize((28, 28)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+    raise ValueError(f"Unknown manual_transform spec: {name!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +106,19 @@ class HFClassifier:
     # ------------------------------------------------------------------
 
     def _load_model(self) -> None:
-        """Load the HF model + its image processor."""
+        """Load the HF model + processor (or fall back to a manual transform)."""
         from transformers import AutoImageProcessor, AutoModelForImageClassification
         hf_id = self._spec["hf_id"]
         logger.debug("Loading HF classifier %s (%s)", self._model_name, hf_id)
         self.model = AutoModelForImageClassification.from_pretrained(hf_id)
-        self.processor = AutoImageProcessor.from_pretrained(hf_id)
         self.model.eval().to(self.device)
+        self._manual_transform = _build_manual_transform(self._spec.get("manual_transform"))
+        self.processor = None if self._manual_transform else AutoImageProcessor.from_pretrained(hf_id)
 
     def _extract_labels(self) -> list[str]:
-        """Order-preserving list of class names from the model's id2label map."""
+        """Order-preserving list of class names. Honour label_override if present."""
+        if "label_override" in self._spec:
+            return list(self._spec["label_override"])
         id2label = self.model.config.id2label
         n = len(id2label)
         return [str(id2label[i]) for i in range(n)]
@@ -148,11 +183,16 @@ class HFClassifier:
 
     def _image_probs(self, image: Image.Image) -> torch.Tensor:
         """Image → softmax distribution over all classes."""
-        inputs = self.processor(
-            images=image.convert("RGB"), return_tensors="pt",
-        ).to(self.device)
-        with torch.no_grad():
-            logits = self.model(**inputs).logits
+        n_ch = getattr(self.model.config, "num_channels", 3)
+        img_in = image.convert("L") if n_ch == 1 else image.convert("RGB")
+        if self._manual_transform is not None:
+            x = self._manual_transform(img_in).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                logits = self.model(x).logits
+        else:
+            inputs = self.processor(images=img_in, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                logits = self.model(**inputs).logits
         return F.softmax(logits[0], dim=-1)
 
     # ------------------------------------------------------------------

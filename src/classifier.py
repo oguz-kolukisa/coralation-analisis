@@ -13,7 +13,13 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import models, transforms
-from torchvision.models import ResNet50_Weights, ViT_L_16_Weights
+from torchvision.models import (
+    ResNet50_Weights, ResNet152_Weights,
+    ConvNeXt_Base_Weights, ConvNeXt_Large_Weights,
+    ViT_B_16_Weights, ViT_L_16_Weights,
+    Swin_T_Weights, Swin_B_Weights,
+    Swin_V2_T_Weights, Swin_V2_B_Weights,
+)
 
 from .models.attention_maps import get_attention_generator, AttentionMapGenerator
 
@@ -45,35 +51,31 @@ _PREPROCESS_512 = transforms.Compose([
 # Model registry — maps model names to loader config
 # ---------------------------------------------------------------------------
 _MODEL_REGISTRY: dict[str, dict] = {
-    "resnet50": {
-        "loader": "_load_resnet50",
-        "target_layer": "layer4.2",
-        "arch": "cnn",
-        "preprocess": _PREPROCESS,
-    },
-    "dinov2_vitb14_lc": {
-        "loader": "_load_dinov2_vitb14_lc",
-        "target_layer": "backbone.blocks.11",
-        "arch": "vit",
-        "preprocess": _PREPROCESS,
-    },
-    "vit_l_16": {
-        "loader": "_load_vit_l_16",
-        "target_layer": "encoder.layers.encoder_layer_23",
-        "arch": "vit",
-        "preprocess": _PREPROCESS_512,
-    },
+    "resnet50":          {"loader": "_load_resnet50",          "target_layer": "layer4.2",                       "arch": "cnn", "preprocess": _PREPROCESS},
+    "resnet152":         {"loader": "_load_resnet152",         "target_layer": "layer4.2",                       "arch": "cnn", "preprocess": _PREPROCESS},
+    "convnext_base":     {"loader": "_load_convnext_base",     "target_layer": "features.7.2",                   "arch": "cnn", "preprocess": _PREPROCESS},
+    "convnext_large":    {"loader": "_load_convnext_large",    "target_layer": "features.7.2",                   "arch": "cnn", "preprocess": _PREPROCESS},
+    "vit_b_16":          {"loader": "_load_vit_b_16",          "target_layer": "encoder.layers.encoder_layer_11","arch": "vit", "preprocess": _PREPROCESS},
+    "vit_l_16":          {"loader": "_load_vit_l_16",          "target_layer": "encoder.layers.encoder_layer_23","arch": "vit", "preprocess": _PREPROCESS},
+    "swin_t":            {"loader": "_load_swin_t",            "target_layer": "features.7.1",                   "arch": "vit", "preprocess": _PREPROCESS},
+    "swin_b":            {"loader": "_load_swin_b",            "target_layer": "features.7.1",                   "arch": "vit", "preprocess": _PREPROCESS},
+    "swin_v2_t":         {"loader": "_load_swin_v2_t",         "target_layer": "features.7.1",                   "arch": "vit", "preprocess": _PREPROCESS},
+    "swin_v2_b":         {"loader": "_load_swin_v2_b",         "target_layer": "features.7.1",                   "arch": "vit", "preprocess": _PREPROCESS},
+    "dinov2_vitb14_lc":  {"loader": "_load_dinov2_vitb14_lc",  "target_layer": "backbone.blocks.11",             "arch": "vit", "preprocess": _PREPROCESS},
+    "dinov2_vitl14_lc":  {"loader": "_load_dinov2_vitl14_lc",  "target_layer": "backbone.blocks.23",             "arch": "vit", "preprocess": _PREPROCESS},
 }
 
 
 def available_classifiers() -> list[str]:
-    """Return names of all supported classifiers (ImageNet + CLIP + HF)."""
+    """Return names of all supported classifiers (ImageNet + CLIP + HF + LADDER)."""
     from .clip_classifier import available_clip_classifiers
     from .hf_classifier import available_hf_classifiers
+    from .ladder_classifier import available_ladder_classifiers
     return (
         list(_MODEL_REGISTRY.keys())
         + available_clip_classifiers()
         + available_hf_classifiers()
+        + available_ladder_classifiers()
     )
 
 
@@ -84,11 +86,14 @@ def build_classifier(
     """Factory: return the correct classifier for a given model name."""
     from .clip_classifier import CLIPClassifier, is_clip_model
     from .hf_classifier import HFClassifier, is_hf_classifier
+    from .ladder_classifier import LadderResNetClassifier, is_ladder_model
     if is_clip_model(name):
         return CLIPClassifier(model_name=name, device=device,
                                label_lookup=label_lookup)
     if is_hf_classifier(name):
         return HFClassifier(model_name=name, device=device)
+    if is_ladder_model(name):
+        return LadderResNetClassifier(model_name=name, device=device)
     return ImageNetClassifier(
         model_name=name, device=device, attention_method=attention_method,
     )
@@ -139,28 +144,36 @@ class ImageNetClassifier:
         self._init_labels()
         self._init_attention_generator()
 
-    def _load_resnet50(self):
-        """Load torchvision ResNet-50 with ImageNet-1k weights."""
-        weights = ResNet50_Weights.IMAGENET1K_V1
-        self.model = models.resnet50(weights=weights)
+    # Each loader sets self.model + self._raw_labels.
+    def _load_resnet50(self):       self._load_tv("resnet50",        ResNet50_Weights.IMAGENET1K_V1)
+    def _load_resnet152(self):      self._load_tv("resnet152",       ResNet152_Weights.IMAGENET1K_V1)
+    def _load_convnext_base(self):  self._load_tv("convnext_base",   ConvNeXt_Base_Weights.IMAGENET1K_V1)
+    def _load_convnext_large(self): self._load_tv("convnext_large",  ConvNeXt_Large_Weights.IMAGENET1K_V1)
+    def _load_vit_b_16(self):       self._load_tv("vit_b_16",        ViT_B_16_Weights.IMAGENET1K_V1)
+    def _load_vit_l_16(self):       self._load_tv("vit_l_16",        ViT_L_16_Weights.IMAGENET1K_V1)
+    def _load_swin_t(self):         self._load_tv("swin_t",          Swin_T_Weights.IMAGENET1K_V1)
+    def _load_swin_b(self):         self._load_tv("swin_b",          Swin_B_Weights.IMAGENET1K_V1)
+    def _load_swin_v2_t(self):      self._load_tv("swin_v2_t",       Swin_V2_T_Weights.IMAGENET1K_V1)
+    def _load_swin_v2_b(self):      self._load_tv("swin_v2_b",       Swin_V2_B_Weights.IMAGENET1K_V1)
+
+    def _load_tv(self, builder_name: str, weights):
+        """Generic torchvision builder dispatch — used by all torchvision loaders."""
+        builder = getattr(models, builder_name)
+        self.model = builder(weights=weights)
         self.model.eval().to(self.device)
         self._raw_labels: list[str] = weights.meta["categories"]
 
     def _load_dinov2_vitb14_lc(self):
         """Load DINOv2 ViT-B/14 with linear classifier from torch.hub."""
-        self.model = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_vitb14_lc",
-            pretrained=True,
-        )
+        self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14_lc", pretrained=True)
         self.model.eval().to(self.device)
         self._raw_labels: list[str] = ResNet50_Weights.IMAGENET1K_V1.meta["categories"]
 
-    def _load_vit_l_16(self):
-        """Load ViT-L/16 with SWAG end-to-end ImageNet-1k weights."""
-        weights = ViT_L_16_Weights.IMAGENET1K_SWAG_E2E_V1
-        self.model = models.vit_l_16(weights=weights)
+    def _load_dinov2_vitl14_lc(self):
+        """Load DINOv2 ViT-L/14 with linear classifier from torch.hub."""
+        self.model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_lc", pretrained=True)
         self.model.eval().to(self.device)
-        self._raw_labels: list[str] = weights.meta["categories"]
+        self._raw_labels: list[str] = ResNet50_Weights.IMAGENET1K_V1.meta["categories"]
 
     def _init_labels(self):
         """Build label lookup from raw labels."""

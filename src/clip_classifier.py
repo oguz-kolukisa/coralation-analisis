@@ -27,26 +27,23 @@ logger = logging.getLogger(__name__)
 # Registry — add a new CLIP/SigLIP model by appending here
 # ---------------------------------------------------------------------------
 _CLIP_REGISTRY: dict[str, dict] = {
-    "clip_vitb32": {
-        "hf_id": "openai/clip-vit-base-patch32",
-        "kind": "clip",
-        "prompt": "a photo of a {label}",
-    },
-    "clip_vitl14": {
-        "hf_id": "openai/clip-vit-large-patch14",
-        "kind": "clip",
-        "prompt": "a photo of a {label}",
-    },
-    "siglip2_base": {
-        "hf_id": "google/siglip2-base-patch16-224",
-        "kind": "siglip",
-        "prompt": "a photo of a {label}.",
-    },
-    "siglip2_large": {
-        "hf_id": "google/siglip2-large-patch16-256",
-        "kind": "siglip",
-        "prompt": "a photo of a {label}.",
-    },
+    # OpenAI CLIP — 4 size variants
+    "clip_vitb32":     {"hf_id": "openai/clip-vit-base-patch32",     "kind": "clip",   "prompt": "a photo of a {label}"},
+    "clip_vitb16":     {"hf_id": "openai/clip-vit-base-patch16",     "kind": "clip",   "prompt": "a photo of a {label}"},
+    "clip_vitl14":     {"hf_id": "openai/clip-vit-large-patch14",    "kind": "clip",   "prompt": "a photo of a {label}"},
+    "clip_vitl14_336": {"hf_id": "openai/clip-vit-large-patch14-336","kind": "clip",   "prompt": "a photo of a {label}"},
+    # Google SigLIP2 base — 4 resolutions
+    "siglip2_base":      {"hf_id": "google/siglip2-base-patch16-224","kind": "siglip", "prompt": "a photo of a {label}."},
+    "siglip2_base_256":  {"hf_id": "google/siglip2-base-patch16-256","kind": "siglip", "prompt": "a photo of a {label}."},
+    "siglip2_base_384":  {"hf_id": "google/siglip2-base-patch16-384","kind": "siglip", "prompt": "a photo of a {label}."},
+    "siglip2_base_512":  {"hf_id": "google/siglip2-base-patch16-512","kind": "siglip", "prompt": "a photo of a {label}."},
+    # Google SigLIP2 large — 3 resolutions
+    "siglip2_large":     {"hf_id": "google/siglip2-large-patch16-256","kind": "siglip","prompt": "a photo of a {label}."},
+    "siglip2_large_384": {"hf_id": "google/siglip2-large-patch16-384","kind": "siglip","prompt": "a photo of a {label}."},
+    "siglip2_large_512": {"hf_id": "google/siglip2-large-patch16-512","kind": "siglip","prompt": "a photo of a {label}."},
+    # Google SigLIP2 giant — 2 resolutions
+    "siglip2_giant_256": {"hf_id": "google/siglip2-giant-opt-patch16-256","kind": "siglip","prompt": "a photo of a {label}."},
+    "siglip2_giant_384": {"hf_id": "google/siglip2-giant-opt-patch16-384","kind": "siglip","prompt": "a photo of a {label}."},
 }
 
 

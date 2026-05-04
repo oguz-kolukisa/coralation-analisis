@@ -60,6 +60,74 @@ def _split_only_data_files(dataset_name: str, split: str) -> dict | None:
     return {split: pattern.format(split=split)}
 
 
+def _is_local_path(name: str) -> bool:
+    """True if ``name`` is a filesystem path rather than an HF dataset id."""
+    return name.startswith(("/", "./", "../"))
+
+
+def _resolve_imagefolder_root(path: str) -> str:
+    """Pick the imagefolder root for ``<root>/<class>/*`` layout.
+
+    NICO++ ships as ``<root>/<domain>/<class>/*`` — we flatten that into
+    one effective imagefolder by symlinking ``<root>/<domain>/<class>`` →
+    ``<flatten>/<class>`` (merging across domains). Idempotent: re-uses an
+    existing flattened root.
+    """
+    from pathlib import Path
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Local dataset path does not exist: {p}")
+    if not p.is_dir():
+        raise NotADirectoryError(f"Local dataset path is not a directory: {p}")
+    if _is_two_level_layout(p):
+        return _flatten_two_level(p)
+    return str(p)
+
+
+def _is_two_level_layout(root) -> bool:
+    """True if every immediate child of root is itself a class-dir-of-dirs."""
+    from pathlib import Path
+    children = [c for c in Path(root).iterdir() if c.is_dir()]
+    if not children:
+        return False
+    # 'splits' is a metadata folder in NICO++ — ignore for this heuristic
+    children = [c for c in children if c.name != "splits"]
+    if not children:
+        return False
+    for c in children:
+        sub = [s for s in c.iterdir() if s.is_dir()]
+        if not sub:
+            return False
+    return True
+
+
+def _flatten_two_level(root) -> str:
+    """Merge ``<root>/<domain>/<class>`` → ``<flat>/<class>`` via symlinks.
+
+    The flattened root is cached as ``<root>/_flat_imagefolder`` and is
+    rebuilt only if missing.
+    """
+    from pathlib import Path
+    flat = Path(root) / "_flat_imagefolder"
+    if flat.exists():
+        return str(flat)
+    flat.mkdir()
+    for domain_dir in Path(root).iterdir():
+        if not domain_dir.is_dir() or domain_dir.name in ("_flat_imagefolder", "splits"):
+            continue
+        for class_dir in domain_dir.iterdir():
+            if not class_dir.is_dir():
+                continue
+            target_class = flat / class_dir.name
+            target_class.mkdir(exist_ok=True)
+            for img in class_dir.iterdir():
+                if img.is_file():
+                    dst = target_class / f"{domain_dir.name}_{img.name}"
+                    if not dst.exists():
+                        dst.symlink_to(img.resolve())
+    return str(flat)
+
+
 def _matches_label(query: str, label: str) -> bool:
     """Check if query matches label by exact synonym matching."""
     query_lower = query.lower().strip()
@@ -96,13 +164,22 @@ class ImageNetSampler:
 
         logger.debug("Loading dataset %s / %s", dataset_name, split)
         with suppress_output():
-            self._ds = load_dataset(
-                dataset_name,
-                data_files=_split_only_data_files(dataset_name, split),
-                split=split,
-                token=hf_token,
-                verification_mode="no_checks",
-            )
+            if _is_local_path(dataset_name):
+                # Local folder: use imagefolder loader. NICO++ has nested
+                # <domain>/<class>/* — flatten via _resolve_imagefolder_root.
+                root = _resolve_imagefolder_root(dataset_name)
+                self._ds = load_dataset(
+                    "imagefolder", data_dir=root, split="train",
+                    verification_mode="no_checks",
+                )
+            else:
+                self._ds = load_dataset(
+                    dataset_name,
+                    data_files=_split_only_data_files(dataset_name, split),
+                    split=split,
+                    token=hf_token,
+                    verification_mode="no_checks",
+                )
         self._max_scan = max_scan
         self._seed = seed if seed is not None else int(time.time())
 

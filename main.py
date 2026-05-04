@@ -187,11 +187,11 @@ def main():
 
     # Config overrides
     parser.add_argument(
-        "--dataset", choices=("imagenet", "cub"), default="imagenet",
+        "--dataset", choices=("imagenet", "imagenet100", "cub", "waterbirds", "colored_mnist", "nicopp"),
+        default="imagenet",
         help=(
-            "Dataset preset: 'imagenet' (default, ILSVRC/imagenet-1k validation) "
-            "or 'cub' (bentrevett/caltech-ucsd-birds-200-2011 test split, 200 bird species). "
-            "Presets the HF dataset id, split, and class source."
+            "Dataset preset: imagenet | imagenet100 | cub | waterbirds | colored_mnist | nicopp. "
+            "Presets HF dataset id, split, and class source."
         ),
     )
     parser.add_argument("--output-dir", default="output", help="Output directory")
